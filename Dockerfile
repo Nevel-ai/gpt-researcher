@@ -1,14 +1,11 @@
 # Stage 1: Browser and build tools installation
-#FROM python:3.13.3-slim-bookworm AS install-browser
-FROM python:3.11.4-slim-bullseye AS install-browser
+# Keep Python 3.11 while using Debian's maintained package repositories.
+FROM python:3.11.16-slim-bookworm AS install-browser
 
 # Install Chromium, Chromedriver, Firefox, Geckodriver, and build tools in one layer
 RUN apt-get update \
     && apt-get install -y gnupg wget ca-certificates --no-install-recommends \
     && ARCH=$(dpkg --print-architecture) \
-    && wget -qO - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=${ARCH}] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
-    && apt-get update \
     && apt-get install -y chromium chromium-driver \
     && chromium --version && chromedriver --version \
     && apt-get install -y --no-install-recommends firefox-esr build-essential \
