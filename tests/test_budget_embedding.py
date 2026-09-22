@@ -10,8 +10,8 @@ from unittest.mock import Mock, patch
 import httpx
 from test_budget_http import module as transport, budget_module as budget, package, Chunks
 
-CAP = "nbgt1.run." + "r" * 43
-RECEIPT = "nbgt1.receipt." + "s" * 43
+CAP = "nbgt2.run." + "r" * 86
+RECEIPT = "nbgt2.receipt." + "s" * 86
 MODEL = "text-embedding-3-small"
 URL = "https://api.openai.com/v1/embeddings"
 

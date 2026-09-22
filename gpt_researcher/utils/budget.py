@@ -86,7 +86,7 @@ class BudgetCallback:
 
 
 def _credential(value):
-    return isinstance(value, str) and len(value) <= 2048 and re.fullmatch(r"nbgt1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}", value) is not None
+    return isinstance(value, str) and len(value) <= 2048 and re.fullmatch(r"nbgt2\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{86}", value) is not None
 
 
 class ResearchBudget:

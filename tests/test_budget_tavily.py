@@ -14,8 +14,8 @@ import httpx
 from test_budget_http import module as transport, budget_module as budget, package
 
 ROOT = Path(__file__).parents[1] / "gpt_researcher"
-CAP = "nbgt1.run." + "r" * 43
-RECEIPT = "nbgt1.receipt." + "s" * 43
+CAP = "nbgt2.run." + "r" * 86
+RECEIPT = "nbgt2.receipt." + "s" * 86
 URL = "https://api.tavily.com/search"
 
 

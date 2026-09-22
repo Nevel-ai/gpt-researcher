@@ -65,7 +65,7 @@ class BudgetHTTPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(sent["trace"]["workspace_id"], "workspace0000001")
                 self.assertEqual(sent["max_tokens"], 200 if mode == "enforce" else 900)
                 self.assertNotIn("receipt", sent)
-                self.assertNotIn("nbgt1.", json.dumps(sent))
+                self.assertNotIn("nbgt2.", json.dumps(sent))
             self.assertEqual(body["trace"]["budget_operation_id"], "untrusted-old-operation")
 
     async def test_cancelled_admission_releases_late_receipt_without_native_call(self):
@@ -126,7 +126,7 @@ class BudgetHTTPTests(unittest.IsolatedAsyncioTestCase):
         operation.finalize.assert_called_once_with("0.2")
     async def test_run_pools_are_reused_closed_and_cannot_admit_after_cancellation(self):
         with patch.dict(sys.modules, {"budget_http_fixture": package, "budget_http_fixture.budget_http": module}):
-            run = budget_module.ResearchBudget("nbgt1.fixture." + "s" * 43, "enforce", Mock())
+            run = budget_module.ResearchBudget("nbgt2.fixture." + "s" * 86, "enforce", Mock())
             clients = run.http_clients()
             self.assertIs(clients["http_client"], run.http_clients()["http_client"])
             await run.aclose()

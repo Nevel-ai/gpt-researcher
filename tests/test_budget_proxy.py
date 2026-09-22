@@ -21,7 +21,7 @@ class BudgetProxyTests(unittest.IsolatedAsyncioTestCase):
         })
         modules.start()
         self.addCleanup(modules.stop)
-        self.run_budget = budget_module.ResearchBudget("nbgt1.fixture." + "s" * 43, "enforce", Mock())
+        self.run_budget = budget_module.ResearchBudget("nbgt2.fixture." + "s" * 86, "enforce", Mock())
         self.addAsyncCleanup(self.run_budget.aclose)
         token = budget_module.current_research_budget.set(self.run_budget)
         self.addCleanup(budget_module.current_research_budget.reset, token)

@@ -33,15 +33,15 @@ class BudgetWebsocketTests(unittest.IsolatedAsyncioTestCase):
         socket.close.assert_awaited_once_with(code=1008)
         manager.connect.assert_not_called()
         communicate.assert_not_called()
-        socket.scope["subprotocols"] = ["nevel-budget-v1"]
+        socket.scope["subprotocols"] = ["nevel-budget-v2"]
         await endpoint(socket)
-        manager.connect.assert_awaited_once_with(socket, subprotocol="nevel-budget-v1")
+        manager.connect.assert_awaited_once_with(socket, subprotocol="nevel-budget-v2")
         communicate.assert_awaited_once_with(socket, manager, require_budget=True)
         manager.disconnect.assert_awaited_once_with(socket)
         # Check the production registration, not just the isolated function.
         tree = ast.parse((SERVER / "app.py").read_text())
         route = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "budget_websocket_endpoint")
-        self.assertEqual(ast.literal_eval(route.decorator_list[0].args[0]), "/ws/budget-v1")
+        self.assertEqual(ast.literal_eval(route.decorator_list[0].args[0]), "/ws/budget-v2")
 
     async def test_invalid_or_missing_capability_never_reaches_start_handler(self):
         for private in (None, {}, {"capability": "forged"}, {"capability": sign(CLAIMS), "mode": "shadow"}):
@@ -58,7 +58,7 @@ class BudgetWebsocketTests(unittest.IsolatedAsyncioTestCase):
                 socket.send_json.assert_awaited_once_with({"type": "error", "metadata": {"budget_error_code": "budget_invalid_transition"}})
 
     async def test_signed_start_validation_preserves_authenticated_mode(self):
-        with patch.dict(module.os.environ, {"JWT_SECRET": SECRET}), patch.object(module.time, "time", return_value=1000):
+        with patch.dict(module.os.environ, {"NEVEL_BUDGET_PUBLIC_KEY": SECRET}), patch.object(module.time, "time", return_value=1000):
             for mode in ("shadow", "enforce"):
                 claims = {**CLAIMS, "mode": mode}
                 data = "start " + json.dumps({"headers": {"nevel_budget": {"capability": sign(claims)}}})

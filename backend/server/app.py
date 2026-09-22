@@ -273,14 +273,14 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.error(f"Unexpected WebSocket error: {str(e)}")
         await manager.disconnect(websocket)
 
-@app.websocket("/ws/budget-v1")
+@app.websocket("/ws/budget-v2")
 async def budget_websocket_endpoint(websocket: WebSocket):
     # Negotiation completes before the caller can send a paid start. Old images
     # lack this route/protocol; clients must never fall back to the legacy route.
-    if "nevel-budget-v1" not in websocket.scope.get("subprotocols", []):
+    if "nevel-budget-v2" not in websocket.scope.get("subprotocols", []):
         await websocket.close(code=1008)
         return
-    await manager.connect(websocket, subprotocol="nevel-budget-v1")
+    await manager.connect(websocket, subprotocol="nevel-budget-v2")
     try:
         await handle_websocket_communication(websocket, manager, require_budget=True)
     finally:

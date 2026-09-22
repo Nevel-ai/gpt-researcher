@@ -10,8 +10,8 @@ from urllib.error import HTTPError
 spec = importlib.util.spec_from_file_location("budget_fixture", Path(__file__).parents[1] / "gpt_researcher/utils/budget.py")
 budget = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(budget)
-CAP = "nbgt1.run." + "r" * 43
-RECEIPT = "nbgt1.receipt." + "s" * 43
+CAP = "nbgt2.run." + "r" * 86
+RECEIPT = "nbgt2.receipt." + "s" * 86
 
 
 def tracked(mode="enforce"):

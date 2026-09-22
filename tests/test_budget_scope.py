@@ -1,7 +1,7 @@
 import asyncio
 import base64
-import hashlib
-import hmac
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 import importlib.util
 import json
 from pathlib import Path
@@ -17,18 +17,30 @@ with patch.dict(sys.modules, {"budget_scope_fixture": package}):
     spec = importlib.util.spec_from_file_location("budget_scope_fixture.budget_scope", ROOT / "budget_scope.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-SECRET = "offline-fixture-secret-only-at-least-32-chars"
+SIGNING_KEY = Ed25519PrivateKey.generate()
+SECRET = SIGNING_KEY.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo).decode()
 CLAIMS = {"version": 1, "kind": "run", "tool": "deep_research", "mode": "enforce", "runId": "test:1", "subject": {"userId": "user000000000001", "workspaceId": "workspace0000001"}, "issuedAt": 1_000_000, "expiresAt": 2_000_000}
 
 
 def sign(claims):
     data = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
-    message = "nbgt1." + data
-    key = hmac.new(SECRET.encode(), b"nevel/budget-bridge/v1", hashlib.sha256).digest()
-    return message + "." + base64.urlsafe_b64encode(hmac.new(key, message.encode(), hashlib.sha256).digest()).decode().rstrip("=")
+    message = "nbgt2." + data
+    return message + "." + base64.urlsafe_b64encode(SIGNING_KEY.sign(message.encode())).decode().rstrip("=")
 
 
 class CapabilityTests(unittest.TestCase):
+    def test_old_envelopes_private_keys_and_jwt_fallback_are_rejected(self):
+        from cryptography.hazmat.primitives.serialization import PrivateFormat, NoEncryption
+        private = SIGNING_KEY.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode()
+        for token, key in [(sign(CLAIMS).replace("nbgt2.", "nbgt1."), SECRET),
+                           (sign(CLAIMS), private), (sign(CLAIMS), "offline-jwt-secret")]:
+            with self.assertRaises(module.ResearchBudgetError):
+                module.verify_run_capability(token, key, 1_000_000)
+        with patch.dict(module.os.environ, {"JWT_SECRET": SECRET, "NEVEL_BUDGET_PUBLIC_KEY": ""}), patch.object(module.time, "time", return_value=1000):
+            request = "start " + json.dumps({"headers": {"nevel_budget": {"capability": sign(CLAIMS)}}})
+            with self.assertRaises(module.ResearchBudgetError):
+                module.verify_budget_start(request)
+
     def test_signed_run_mode_and_expiry(self):
         self.assertEqual(module.verify_run_capability(sign(CLAIMS), SECRET, 1_000_000), CLAIMS)
         with self.assertRaises(module.ResearchBudgetError):
@@ -53,7 +65,7 @@ class ScopeTests(unittest.IsolatedAsyncioTestCase):
         @module.with_research_budget
         async def run(headers=None):
             return "partial fallback"
-        with patch.dict(module.os.environ, {"JWT_SECRET": SECRET}), patch.object(module.time, "time", return_value=1000), patch.object(module, "ResearchBudget", return_value=owned):
+        with patch.dict(module.os.environ, {"NEVEL_BUDGET_PUBLIC_KEY": SECRET}), patch.object(module.time, "time", return_value=1000), patch.object(module, "ResearchBudget", return_value=owned):
             with self.assertRaises(module.ResearchBudgetError) as caught:
                 await run(headers={"nevel_budget": {"capability": sign(CLAIMS)}})
         self.assertEqual(caught.exception.code, "budget_exceeded")
@@ -73,7 +85,7 @@ class ScopeTests(unittest.IsolatedAsyncioTestCase):
                 return module.current_research_budget.get()
             self.assertEqual(await asyncio.gather(child(), child()), [owned, owned])
             return "done"
-        with patch.dict(module.os.environ, {"JWT_SECRET": SECRET}), patch.object(module.time, "time", return_value=1000), patch.object(module, "ResearchBudget", return_value=owned) as factory:
+        with patch.dict(module.os.environ, {"NEVEL_BUDGET_PUBLIC_KEY": SECRET}), patch.object(module.time, "time", return_value=1000), patch.object(module, "ResearchBudget", return_value=owned) as factory:
             self.assertEqual(await run(headers), "done")
             factory.assert_called_once_with(headers["nevel_budget"]["capability"], "enforce")
         self.assertIsNone(module.current_research_budget.get())
@@ -85,7 +97,7 @@ class ScopeTests(unittest.IsolatedAsyncioTestCase):
         @module.with_research_budget
         async def run(headers=None):
             raise asyncio.CancelledError()
-        with patch.dict(module.os.environ, {"JWT_SECRET": SECRET}), patch.object(module.time, "time", return_value=1000), patch.object(module, "ResearchBudget", return_value=owned):
+        with patch.dict(module.os.environ, {"NEVEL_BUDGET_PUBLIC_KEY": SECRET}), patch.object(module.time, "time", return_value=1000), patch.object(module, "ResearchBudget", return_value=owned):
             with self.assertRaises(asyncio.CancelledError):
                 await run(headers={"nevel_budget": {"capability": sign(CLAIMS)}})
         owned.aclose.assert_awaited_once()
@@ -96,7 +108,7 @@ class ScopeTests(unittest.IsolatedAsyncioTestCase):
         @module.with_research_budget
         async def run(headers=None):
             called()
-        with patch.dict(module.os.environ, {"JWT_SECRET": SECRET}), patch.object(module.time, "time", return_value=1000):
+        with patch.dict(module.os.environ, {"NEVEL_BUDGET_PUBLIC_KEY": SECRET}), patch.object(module.time, "time", return_value=1000):
             with self.assertRaises(module.ResearchBudgetError):
                 await run(headers={"nevel_budget": {"capability": "invalid", "mode": "shadow"}})
         called.assert_not_called()
@@ -107,7 +119,7 @@ class ScopeTests(unittest.IsolatedAsyncioTestCase):
         async def run(headers=None):
             called()
             self.assertNotIn("nevel_budget", headers)
-        with patch.dict(module.os.environ, {"JWT_SECRET": SECRET}), patch.object(module.time, "time", return_value=1000), patch.object(module, "ResearchBudget", side_effect=RuntimeError("missing config")):
+        with patch.dict(module.os.environ, {"NEVEL_BUDGET_PUBLIC_KEY": SECRET}), patch.object(module.time, "time", return_value=1000), patch.object(module, "ResearchBudget", side_effect=RuntimeError("missing config")):
             with self.assertLogs("budget_scope_fixture.budget_scope", level="WARNING"):
                 await run(headers={"nevel_budget": {"capability": sign({**CLAIMS, "mode": "shadow"})}})
             with self.assertRaises(module.ResearchBudgetError):
