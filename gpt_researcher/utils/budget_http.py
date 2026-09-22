@@ -198,11 +198,11 @@ def _prepare_request(budget, request, data):
 
 
 class ResearchBudgetTransport(httpx.AsyncBaseTransport):
-    def __init__(self, budget, native_client=None):
+    def __init__(self, budget, native_client=None, proxy=None):
         self.budget = budget
         # Inner client retains env proxies; outer client MUST use trust_env=False
         # so proxy mounts cannot bypass the budget transport.
-        self.native = native_client if native_client is not None else httpx.AsyncClient(follow_redirects=False)
+        self.native = native_client if native_client is not None else httpx.AsyncClient(proxy=proxy, follow_redirects=False)
 
     async def handle_async_request(self, request):
         data = await request.aread()
@@ -321,9 +321,9 @@ class _ObservedSyncStream(httpx.SyncByteStream):
 
 
 class ResearchBudgetSyncTransport(httpx.BaseTransport):
-    def __init__(self, budget, native_client=None):
+    def __init__(self, budget, native_client=None, proxy=None):
         self.budget = budget
-        self.native = native_client if native_client is not None else httpx.Client(follow_redirects=False)
+        self.native = native_client if native_client is not None else httpx.Client(proxy=proxy, follow_redirects=False)
 
     def handle_request(self, request):
         request, operation = _prepare_request(self.budget, request, request.read())

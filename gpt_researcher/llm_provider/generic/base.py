@@ -153,7 +153,11 @@ class GenericLLMProvider:
                         raise ResearchBudgetError("budget_invalid_transition")
                     logging.getLogger(__name__).warning("Shadow research custom HTTP client is not budget-instrumented")
                 else:
-                    kwargs.update(budget.http_clients())
+                    proxy = kwargs.get("openai_proxy", os.getenv("OPENAI_PROXY"))
+                    kwargs.update(budget.http_clients(proxy=proxy))
+                    # Proxy is owned by the metered inner client. Prevent
+                    # LangChain from configuring another client from the env.
+                    kwargs["openai_proxy"] = ""
                 # LangChain/OpenAI SDK retries would be new native requests with
                 # new step numbers. Disable before any paid call in enforcement.
                 if budget.mode == "enforce":

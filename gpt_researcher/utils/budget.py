@@ -98,7 +98,7 @@ class ResearchBudget:
         self._callback = callback if callback is not None else BudgetCallback(os.environ.get("NEVEL_BUDGET_URL", ""))
         self._counter = 0
         self._lock = Lock()
-        self._clients = None
+        self._clients = {}
         self._closed = False
         self._failure = None
 
@@ -203,30 +203,40 @@ class ResearchBudget:
             if self._failure:
                 raise ResearchBudgetError(self._failure)
 
-    def http_clients(self):
-        # Reuse one connection pool pair per run, not one pair per model step.
+    def http_clients(self, proxy=None):
+        # OPENAI_PROXY applies only to model/embedding clients, not Tavily.
+        # Reuse a pool pair per run and routing configuration.
+        proxy = proxy or None
         with self._lock:
             if self._closed:
                 raise ResearchBudgetError("budget_invalid_transition")
-            if self._clients is None:
+            if proxy not in self._clients:
                 import httpx
                 from .budget_http import ResearchBudgetTransport, ResearchBudgetSyncTransport
-                self._clients = {
-                    "http_client": httpx.Client(transport=ResearchBudgetSyncTransport(self), trust_env=False),
-                    "http_async_client": httpx.AsyncClient(transport=ResearchBudgetTransport(self), trust_env=False),
+                self._clients[proxy] = {
+                    "http_client": httpx.Client(transport=ResearchBudgetSyncTransport(self, proxy=proxy), trust_env=False),
+                    "http_async_client": httpx.AsyncClient(transport=ResearchBudgetTransport(self, proxy=proxy), trust_env=False),
                 }
-            return dict(self._clients)
+            return dict(self._clients[proxy])
 
     async def aclose(self):
         with self._lock:
             self._closed = True
-            clients = self._clients
-            self._clients = None
-        if clients is not None:
+            pools = list(self._clients.values())
+            self._clients = {}
+        failure = None
+        for clients in pools:
             try:
-                await clients["http_async_client"].aclose()
-            finally:
-                await asyncio.to_thread(clients["http_client"].close)
+                try:
+                    await clients["http_async_client"].aclose()
+                finally:
+                    await asyncio.to_thread(clients["http_client"].close)
+            except BaseException as error:
+                # Close every pool even if one close fails or is cancelled.
+                if failure is None:
+                    failure = error
+        if failure is not None:
+            raise failure
 
 
 class ResearchBudgetOperation:

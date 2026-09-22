@@ -44,7 +44,9 @@ class Memory:
                     raise ResearchBudgetError("budget_invalid_transition")
                 logging.getLogger(__name__).warning("Shadow research embedding provider is not metered")
             else:
-                embedding_kwargs.update(budget.http_clients())
+                proxy = embedding_kwargs.get("openai_proxy", os.getenv("OPENAI_PROXY"))
+                embedding_kwargs.update(budget.http_clients(proxy=proxy))
+                embedding_kwargs["openai_proxy"] = ""
                 # Keep length-safe tokenization/splitting, but bound vector
                 # response size and per-request reservation, not research size.
                 embedding_kwargs["chunk_size"] = 16
