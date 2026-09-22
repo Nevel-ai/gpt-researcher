@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from gpt_researcher.document.document import DocumentLoader
 from gpt_researcher import GPTResearcher
 from gpt_researcher.utils.budget import find_budget_error
+from gpt_researcher.utils.budget_scope import verify_budget_start
 from utils import write_md_to_pdf, write_md_to_word, write_text_to_md
 from pathlib import Path
 from datetime import datetime
@@ -285,7 +286,7 @@ async def execute_multi_agents(manager) -> Any:
         )
 
 
-async def handle_websocket_communication(websocket, manager):
+async def handle_websocket_communication(websocket, manager, require_budget=False):
     running_task: asyncio.Task | None = None
 
     def run_long_running_task(awaitable: Awaitable) -> asyncio.Task:
@@ -334,6 +335,13 @@ async def handle_websocket_communication(websocket, manager):
                     )
                 # Normalize command detection by checking startswith after stripping whitespace
                 elif data.strip().startswith("start"):
+                    if require_budget:
+                        try:
+                            verify_budget_start(data)
+                        except Exception:
+                            await websocket.send_json({"type": "error", "metadata": {"budget_error_code": "budget_invalid_transition"}})
+                            await websocket.close(code=1008)
+                            return
                     logger.info(f"Processing start command")
                     running_task = run_long_running_task(
                         handle_start_command(websocket, data, manager)

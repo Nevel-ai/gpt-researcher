@@ -48,10 +48,10 @@ class WebSocketManager:
                 print(f"Error in sender task: {e}")
                 break
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, subprotocol=None):
         """Connect a websocket."""
         try:
-            await websocket.accept()
+            await websocket.accept(subprotocol=subprotocol)
             self.active_connections.append(websocket)
             self.message_queues[websocket] = asyncio.Queue()
             self.sender_tasks[websocket] = asyncio.create_task(

@@ -45,6 +45,20 @@ def verify_run_capability(token, secret, now_ms=None):
         raise ResearchBudgetError("budget_invalid_transition") from None
 
 
+def verify_budget_start(data):
+    """Versioned socket never accepts a start lacking an authenticated budget."""
+    try:
+        if not isinstance(data, str) or not data.startswith("start "):
+            raise ValueError()
+        request = json.loads(data[6:])
+        private = request["headers"]["nevel_budget"]
+        if not isinstance(private, dict) or set(private) != {"capability"}:
+            raise ValueError()
+        return verify_run_capability(private["capability"], os.environ.get("JWT_SECRET", ""))
+    except Exception:
+        raise ResearchBudgetError("budget_invalid_transition") from None
+
+
 def with_research_budget(function):
     signature = inspect.signature(function)
 
