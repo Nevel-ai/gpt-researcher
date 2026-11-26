@@ -7,6 +7,8 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+import credentials_fixture  # noqa: F401  Real light credentials package, without the heavy gpt_researcher import.
+
 ROOT = Path(__file__).parents[1]
 usage_spec = importlib.util.spec_from_file_location("usage_fixture", ROOT / "gpt_researcher/utils/usage.py")
 usage = importlib.util.module_from_spec(usage_spec)

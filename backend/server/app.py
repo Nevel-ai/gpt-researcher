@@ -31,6 +31,7 @@ from server.websocket_manager import run_agent
 from utils import write_md_to_word, write_md_to_pdf
 from gpt_researcher.utils.enum import Tone
 from chat.chat import ChatAgentWithMemory
+from gpt_researcher import credentials
 
 # MongoDB services removed - no database persistence needed
 
@@ -66,7 +67,10 @@ class ChatRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # Startup. Each uvicorn worker process runs this and owns its own credential reader. An invalid
+    # CHAT_CONFIG_CREDENTIAL_SOURCE stops the process here; a Vault outage does not (readiness reports it).
+    credential_mode = credentials.start()
+    logger.info("Research provider credentials: %s mode", credential_mode)
     os.makedirs("outputs", exist_ok=True)
     app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
     
@@ -87,6 +91,7 @@ async def lifespan(app: FastAPI):
     logger.info("GPT Researcher API ready - local mode (no database persistence)")
     yield
     # Shutdown
+    credentials.stop()
     logger.info("Research API shutting down")
 
 # App initialization
@@ -134,6 +139,25 @@ DOC_PATH = os.getenv("DOC_PATH", "./my-docs")
 
 
 # Routes
+@app.get("/health")
+async def health():
+    """Liveness: independent of provider credentials, so a pod waiting for Vault is not restarted."""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready():
+    """Readiness of the worker process that serves this request; only the mode and the result are exposed."""
+    state = credentials.readiness()
+    return JSONResponse(status_code=200 if state["ready"] else 503, content={"credentials": state})
+
+
+def _credential_refusal(headers=None):
+    refusal = credentials.start_error(headers)
+    return None if refusal is None else JSONResponse(status_code=503 if refusal["code"] == "credentials_unavailable" else 400,
+                                                     content=refusal)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     """Serve the main frontend HTML page."""
@@ -224,6 +248,9 @@ async def write_report(research_request: ResearchRequest, research_id: str = Non
 
 @app.post("/report/")
 async def generate_report(research_request: ResearchRequest, background_tasks: BackgroundTasks):
+    refusal = _credential_refusal(research_request.headers)
+    if refusal:
+        return refusal
     research_id = sanitize_filename(f"task_{int(time.time())}_{research_request.task}")
 
     if research_request.generate_in_background:
@@ -297,6 +324,9 @@ async def chat(chat_request: ChatRequest):
     Returns:
         JSON response with the assistant's message and any tool usage metadata
     """
+    refusal = _credential_refusal()
+    if refusal:
+        return refusal
     try:
         logger.info(f"Received chat request with {len(chat_request.messages)} messages")
 
@@ -336,6 +366,9 @@ async def research_report_chat(research_id: str, request: Request):
     """Handle chat requests for a specific research report.
     Directly processes the raw request data to avoid validation errors.
     """
+    refusal = _credential_refusal()
+    if refusal:
+        return refusal
     try:
         # Get raw JSON data from request
         data = await request.json()
