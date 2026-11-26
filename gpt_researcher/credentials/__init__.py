@@ -29,7 +29,7 @@ UNAVAILABLE_MESSAGE = "Research credentials unavailable"
 __all__ = [
     "CredentialConfigError", "CredentialPolicyError", "CredentialUnavailableError", "find_credential_error",
     "credential_mode", "start", "stop", "vault_mode", "provider_key", "provider_credential", "readiness",
-    "require_ready", "reject_credential_headers", "reject_credential_kwargs", "start_error",
+    "require_ready", "reject_credential_headers", "reject_credential_kwargs", "refusal_payload", "start_error",
     "with_research_credentials", "SOURCES",
 ]
 
@@ -155,14 +155,19 @@ def reject_credential_kwargs(kwargs):
         raise CredentialPolicyError()
 
 
+def refusal_payload(error):
+    """The sanitized body for a credential error: a fixed message and its code, never source details or values."""
+    return {"error": UNAVAILABLE_MESSAGE if isinstance(error, CredentialUnavailableError) else str(error),
+            "code": error.code}
+
+
 def start_error(headers=None):
     """Sanitized refusal for a business entrypoint, or None. Local check only, before any budget or paid call."""
     try:
         reject_credential_headers(headers)
         require_ready()
     except (CredentialPolicyError, CredentialUnavailableError) as error:
-        return {"error": UNAVAILABLE_MESSAGE if isinstance(error, CredentialUnavailableError) else str(error),
-                "code": error.code}
+        return refusal_payload(error)
     return None
 
 

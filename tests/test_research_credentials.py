@@ -846,8 +846,9 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_research_and_chat_entrypoints_refuse_before_work(self):
         agent, write = Mock(), AsyncMock()
         namespace = self.app_namespace(ChatAgentWithMemory=agent, write_report=write, sanitize_filename=lambda name: name)
-        refusal, chat, report_chat, generate = load_functions(
-            self.app, ["_credential_refusal", "chat", "research_report_chat", "generate_report"], namespace)
+        refusal, chat, report_chat, generate, _, _ = load_functions(
+            self.app, ["_credential_refusal", "chat", "research_report_chat", "generate_report",
+                       "_credential_response", "_credential_failure"], namespace)
         request = Mock(json=AsyncMock(return_value={"report": "r", "messages": []}))
         for response in [await chat(SimpleNamespace(report="r", messages=[])), await report_chat("id", request),
                          await generate(SimpleNamespace(headers=None, task="t", generate_in_background=True), Mock())]:
@@ -858,6 +859,48 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((override.status_code, override.content["code"]), (400, "credential_override_forbidden"))
         agent.assert_not_called()
         write.assert_not_called()
+
+    async def test_chat_handlers_map_credential_errors_after_the_gate_to_the_sanitized_response(self):
+        """The gate passed, then the key was withdrawn mid-request (the tool helper raises before its follow-up)."""
+        self.v.client.refresh_once()
+        outcome = {}
+
+        class Agent:
+            def __init__(self, **kwargs):
+                pass
+
+            async def chat(self, messages, websocket):
+                error = outcome["error"]
+                if error is None:
+                    return "answer", None
+                raise error
+
+        namespace = self.app_namespace(ChatAgentWithMemory=Agent)
+        chat, report_chat, *_ = load_functions(
+            self.app, ["chat", "research_report_chat", "_credential_refusal", "_credential_response", "_credential_failure"], namespace)
+        request = Mock(json=AsyncMock(return_value={"report": "r", "messages": []}))
+        handlers = {"/api/chat": lambda: chat(SimpleNamespace(report="r", messages=[])),
+                    "/api/reports/{id}/chat": lambda: report_chat("id", request)}
+        wrapped = RuntimeError("SDK wrapper")
+        wrapped.__cause__ = CredentialUnavailableError("openrouter-chat")
+        cases = [
+            (CredentialUnavailableError("openrouter-chat"), 503, {"error": "Research credentials unavailable", "code": "credentials_unavailable"}),
+            (wrapped, 503, {"error": "Research credentials unavailable", "code": "credentials_unavailable"}),
+            (CredentialPolicyError(), 400, {"error": "Provider credentials cannot be supplied with the request", "code": "credential_override_forbidden"}),
+        ]
+        for route, handler in handlers.items():
+            for error, status, body in cases:
+                outcome["error"] = error
+                with self.subTest(route=route, error=type(error).__name__):
+                    response = await handler()
+                    self.assertIsInstance(response, FakeJSONResponse)
+                    self.assertEqual((response.status_code, response.content), (status, body))
+                    self.assertNotIn(SECRET_MARK, json.dumps(response.content))
+            # Unrelated failures keep the legacy body (HTTP 200 with the error text); success is unchanged.
+            outcome["error"] = ValueError("model said no")
+            self.assertEqual(await handler(), {"error": "model said no"})
+            outcome["error"] = None
+            self.assertEqual((await handler())["response"]["content"], "answer")
 
     async def test_multi_agent_entrypoint_refuses_before_work(self):
         task = AsyncMock()

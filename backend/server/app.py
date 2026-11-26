@@ -152,10 +152,22 @@ async def ready():
     return JSONResponse(status_code=200 if state["ready"] else 503, content={"credentials": state})
 
 
+def _credential_response(payload):
+    return JSONResponse(status_code=503 if payload["code"] == "credentials_unavailable" else 400, content=payload)
+
+
 def _credential_refusal(headers=None):
     refusal = credentials.start_error(headers)
-    return None if refusal is None else JSONResponse(status_code=503 if refusal["code"] == "credentials_unavailable" else 400,
-                                                     content=refusal)
+    return None if refusal is None else _credential_response(refusal)
+
+
+def _credential_failure(error):
+    """A credential error raised after the gate (e.g. a key withdrawn mid-request): the gate's sanitized response."""
+    credential_error = credentials.find_credential_error(error)
+    if credential_error is None:
+        return None
+    logger.warning("Chat request stopped: %s", credential_error.code)
+    return _credential_response(credentials.refusal_payload(credential_error))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -358,6 +370,9 @@ async def chat(chat_request: ChatRequest):
         logger.info(f"Returning formatted response: {json.dumps(response_message)[:100]}...")
         return {"response": response_message}
     except Exception as e:
+        failure = _credential_failure(e)
+        if failure:
+            return failure
         logger.error(f"Error processing chat request: {str(e)}", exc_info=True)
         return {"error": str(e)}
 
@@ -398,6 +413,9 @@ async def research_report_chat(research_id: str, request: Request):
 
         return {"response": response_message}
     except Exception as e:
+        failure = _credential_failure(e)
+        if failure:
+            return failure
         logger.error(f"Error in research report chat: {str(e)}", exc_info=True)
         return {"error": str(e)}
 

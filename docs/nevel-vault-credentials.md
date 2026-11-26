@@ -32,7 +32,8 @@ The role needs exactly `read` on these three `kv/data/...` paths and `update` on
 
 ## Cache, refresh and revocation
 
-- One background thread per worker process polls every 15 s (+/-20%), backing off 1 s → 60 s after failures.
+- One background thread per worker process polls every 15 s (+/-20%). After failures it backs off 1 s, 2 s, 4 s, …
+  with the same +/-20% jitter, capped at 60 s (so a sustained outage retries every 51.2–60 s).
   Business requests never wait for Vault.
 - A validated value stays usable for 48 hours after its last successful read, in memory only. A restart starts
   empty. Login, renewal and failed reads do not extend it.
@@ -42,7 +43,8 @@ The role needs exactly `read` on these three `kv/data/...` paths and `update` on
   JWKS failure looks the same to Vault as a revocation.
 - A new version that fails validation is ignored; the accepted one keeps its original age. A value must be
   printable ASCII without spaces or control characters (it travels in HTTP headers and JSON bodies).
-- The failure backoff is capped before it is computed, so an outage of any length keeps polling every 60 s.
+- The backoff exponent is capped before it is computed, so an outage of any length keeps retrying at the jittered
+  ceiling instead of stopping.
 - The token is renewed at 60–70% of its TTL; a denied renewal, expiry or a lease capped by `token_max_ttl`
   leads to a new login.
 - HTTPS with certificate verification, no redirects, env proxies ignored, 5 s per request, responses limited to
@@ -82,7 +84,8 @@ After a revocation or deletion, the next client construction / embedding call fa
   lost during a run fail the run (`credentials_unavailable`) even where legacy code swallows provider errors.
   Tool errors and the tool helper's fallback completion never absorb a credential failure.
 - WebSocket refusal: `{"type": "error", "output": ..., "metadata": {"credentials_error_code": ...}}`; HTTP: 503
-  (unavailable) or 400 (override), `{"error", "code"}`.
+  (unavailable) or 400 (override), `{"error", "code"}`. `/api/chat` and `/api/reports/{id}/chat` return the same
+  response when the key is withdrawn after the gate, mid-request; other errors keep their previous body.
 
 Not managed here: other retrievers/LLM providers, `NEVEL_BUDGET_PUBLIC_KEY` (public), `JWT_SECRET` (no reader
 since the Ed25519 budget capabilities; its env delivery is kept for rollback to older images).
