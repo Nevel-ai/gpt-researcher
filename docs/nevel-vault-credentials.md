@@ -83,6 +83,8 @@ After a revocation or deletion, the next client construction / embedding call fa
   `/report/`, `/api/multi_agents`, `/api/chat`, `/api/reports/{id}/chat`, and `run_agent` itself. Credentials
   lost during a run fail the run (`credentials_unavailable`) even where legacy code swallows provider errors.
   Tool errors and the tool helper's fallback completion never absorb a credential failure.
+  A budget error anywhere in the exception chain (cause or context) always wins over a credential error, in the
+  run gate and in the WebSocket report, so Chat still receives `budget_error_code` (exhausted / reconciliation).
 - WebSocket refusal: `{"type": "error", "output": ..., "metadata": {"credentials_error_code": ...}}`; HTTP: 503
   (unavailable) or 400 (override), `{"error", "code"}`. `/api/chat` and `/api/reports/{id}/chat` return the same
   response when the key is withdrawn after the gate, mid-request; other errors keep their previous body.

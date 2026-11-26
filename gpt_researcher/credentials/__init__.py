@@ -19,6 +19,7 @@ from functools import wraps
 
 from .errors import (
     SOURCES, CredentialConfigError, CredentialPolicyError, CredentialUnavailableError, find_credential_error,
+    find_in_chain, find_research_budget_error,
 )
 
 MODE_ENV = "CHAT_CONFIG_CREDENTIAL_SOURCE"
@@ -28,6 +29,7 @@ UNAVAILABLE_MESSAGE = "Research credentials unavailable"
 
 __all__ = [
     "CredentialConfigError", "CredentialPolicyError", "CredentialUnavailableError", "find_credential_error",
+    "find_in_chain", "find_research_budget_error",
     "credential_mode", "start", "stop", "vault_mode", "provider_key", "provider_credential", "readiness",
     "require_ready", "reject_credential_headers", "reject_credential_kwargs", "refusal_payload", "start_error",
     "with_research_credentials", "SOURCES",
@@ -189,7 +191,8 @@ def with_research_credentials(function):
         try:
             result = await function(*args, **kwargs)
         except Exception as error:
-            if failures and find_credential_error(error) is None:
+            # Never replace a budget classification: it decides whether paid work needs reconciliation.
+            if failures and find_credential_error(error) is None and find_research_budget_error(error) is None:
                 raise CredentialUnavailableError(failures[0]) from None
             raise
         finally:

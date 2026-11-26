@@ -10,8 +10,8 @@ from typing import Awaitable, Dict, List, Any
 from fastapi.responses import JSONResponse, FileResponse
 from gpt_researcher.document.document import DocumentLoader
 from gpt_researcher import GPTResearcher
-from gpt_researcher.utils.budget import find_budget_error
-from gpt_researcher.credentials import find_credential_error, start_error as credential_start_error
+from gpt_researcher.utils.budget import ResearchBudgetError, find_budget_error
+from gpt_researcher.credentials import find_credential_error, find_in_chain, start_error as credential_start_error
 from gpt_researcher.utils.budget_scope import verify_budget_start
 from utils import write_md_to_pdf, write_md_to_word, write_text_to_md
 from pathlib import Path
@@ -301,7 +301,9 @@ async def handle_websocket_communication(websocket, manager, require_budget=Fals
                 logger.info("Task cancelled.")
                 raise
             except Exception as e:
-                credential_error = find_credential_error(e)
+                # Budget classification first, anywhere in the chain: Chat maps it to exhausted/reconciliation.
+                budget_error = find_budget_error(e) or find_in_chain(e, ResearchBudgetError)
+                credential_error = None if budget_error else find_credential_error(e)
                 if credential_error:
                     # Sanitized: no provider/Vault details, never a credential value.
                     logger.warning("Research stopped: %s", credential_error.code)
@@ -311,7 +313,6 @@ async def handle_websocket_communication(websocket, manager, require_budget=Fals
                         "metadata": {"credentials_error_code": credential_error.code},
                     })
                     return
-                budget_error = find_budget_error(e)
                 if budget_error:
                     logger.warning("Research stopped by budget policy: %s", budget_error.code)
                 else:

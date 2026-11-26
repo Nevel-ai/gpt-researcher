@@ -806,6 +806,158 @@ class _AnyResult:
 ANY_RESULT = _AnyResult()
 
 
+class BudgetPrecedenceTests(unittest.IsolatedAsyncioTestCase):
+    """A run that loses a credential and is also denied by the budget reports the budget classification.
+
+    Uses the real credential and budget run decorators (in production order) and the real WebSocket task wrapper.
+    The budget client is a stand-in whose `raise_if_denied` reports the denial, as the budget scope tests do.
+    """
+
+    def setUp(self):
+        try:
+            from test_budget_scope import module as scope, sign, CLAIMS, SECRET
+        except ImportError as error:  # cryptography is required by the budget scope (installed in CI).
+            self.skipTest(f"budget scope unavailable: {error}")
+        self.scope, self.capability, self.secret = scope, sign(CLAIMS), SECRET
+        # The same budget module the scope uses (the scope fixture registers it only while loading).
+        budget_globals = scope.ResearchBudgetError.__init__.__globals__
+        self.budget_module = SimpleNamespace(ResearchBudgetError=scope.ResearchBudgetError,
+                                             find_budget_error=budget_globals["find_budget_error"],
+                                             current_research_budget=scope.current_research_budget)
+        modules = patch.dict(sys.modules, {"gpt_researcher.utils.budget": self.budget_module})
+        modules.start()
+        self.addCleanup(modules.stop)
+        environment = patch.dict(scope.os.environ, {"NEVEL_BUDGET_PUBLIC_KEY": SECRET})
+        environment.start()
+        self.addCleanup(environment.stop)
+        clock = patch.object(scope.time, "time", return_value=1000)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.v = VaultFixture(self)
+        self.v.install(self)
+        self.v.client.refresh_once()
+        self.paid = []
+
+    def run_agent(self, body, code="budget_internal_error"):
+        owned = Mock(aclose=AsyncMock())
+        owned.raise_if_denied.side_effect = self.scope.ResearchBudgetError(code)
+        factory = patch.object(self.scope, "ResearchBudget", return_value=owned)
+        factory.start()
+        self.addCleanup(factory.stop)
+        return credentials.with_research_credentials(self.scope.with_research_budget(body))
+
+    def withdraw_tavily(self):
+        self.v.fake.overrides["providers/tavily/dev/chat"] = lambda: httpx.Response(404, json={"errors": []})
+        self.v.client.refresh_once()
+
+    async def test_swallowed_credential_failure_then_budget_denial_keeps_the_budget_error(self):
+        async def research(task, headers=None):
+            self.paid.append("first paid step")
+            self.withdraw_tavily()
+            try:
+                credentials.provider_key("tavily-chat", None)
+            except CredentialUnavailableError:
+                return "report from empty search results"  # Legacy code swallowed it.
+
+        with self.assertRaises(self.scope.ResearchBudgetError) as caught:
+            await self.run_agent(research)("task", headers={"nevel_budget": {"capability": self.capability}})
+        self.assertEqual(caught.exception.code, "budget_internal_error")
+        self.assertEqual(self.paid, ["first paid step"])  # Nothing retried or repeated.
+
+    async def test_budget_denial_raised_while_handling_a_credential_error_keeps_the_budget_error(self):
+        async def research(task, headers=None):
+            self.withdraw_tavily()
+            credentials.provider_key("tavily-chat", None)  # Raises; the budget scope denies in its except block.
+
+        with self.assertRaises(self.scope.ResearchBudgetError) as caught:
+            await self.run_agent(research, "budget_exceeded")("task", headers={"nevel_budget": {"capability": self.capability}})
+        self.assertEqual(caught.exception.code, "budget_exceeded")
+        self.assertIsInstance(caught.exception.__context__, CredentialUnavailableError)
+
+    async def test_chain_search_follows_both_cause_and_context(self):
+        budget = self.scope.ResearchBudgetError("budget_internal_error")
+        credential = CredentialUnavailableError("tavily-chat")
+        wrapper = RuntimeError("SDK wrapper")
+        wrapper.__cause__, wrapper.__context__ = credential, budget  # The cause hides the context on one path.
+        self.assertIs(credentials.find_research_budget_error(wrapper), budget)
+        self.assertIs(credentials.find_credential_error(wrapper), credential)
+        loop = RuntimeError("loop")
+        loop.__context__ = loop
+        self.assertIsNone(credentials.find_in_chain(loop, CredentialUnavailableError))
+
+    async def socket_frames(self, start):
+        namespace = {"asyncio": asyncio, "Awaitable": Awaitable, "logger": logging.getLogger(__name__), "json": json,
+                     "traceback": traceback, "verify_budget_start": Mock(), "handle_start_command": start,
+                     "credential_start_error": credentials.start_error, "find_credential_error": credentials.find_credential_error,
+                     "find_in_chain": credentials.find_in_chain, "find_budget_error": self.budget_module.find_budget_error,
+                     "ResearchBudgetError": self.scope.ResearchBudgetError}
+        communicate, _ = load_functions(ROOT / "backend/server/server_utils.py", ["handle_websocket_communication", "_start_headers"], namespace)
+        messages = ["start " + json.dumps({"task": "t", "headers": {"nevel_budget": {"capability": self.capability}}})]
+
+        async def receive():
+            if messages:
+                return messages.pop()
+            await asyncio.sleep(0.05)
+            raise RuntimeError("closed")
+
+        socket = Mock(receive_text=receive, send_json=AsyncMock(), close=AsyncMock())
+        await communicate(socket, Mock(), require_budget=True)
+        return [call.args[0] for call in socket.send_json.await_args_list]
+
+    async def test_websocket_reports_budget_code_for_every_combined_failure(self):
+        cases = {}
+
+        async def swallowed(task, headers=None):
+            self.withdraw_tavily()
+            try:
+                credentials.provider_key("tavily-chat", None)
+            except CredentialUnavailableError:
+                return "empty report"
+
+        async def raised(task, headers=None):
+            self.withdraw_tavily()
+            credentials.provider_key("tavily-chat", None)
+
+        async def credential_after_budget(task, headers=None):
+            try:
+                raise self.scope.ResearchBudgetError("budget_exceeded")
+            except self.scope.ResearchBudgetError:
+                raise CredentialUnavailableError("tavily-chat")  # Budget error only in __context__.
+
+        for name, body, code in (("swallowed", swallowed, "budget_internal_error"), ("context", raised, "budget_exceeded"),
+                                 ("credential on top", credential_after_budget, "budget_exceeded")):
+            self.v.fake.overrides.clear()  # Each run starts ready (the gate refuses a run that starts without keys).
+            self.v.client.refresh_once()
+            run = self.run_agent(body, code)
+
+            async def start(websocket, data, manager, run=run):
+                await run("t", headers={"nevel_budget": {"capability": self.capability}})
+
+            cases[name] = (await self.socket_frames(start), code)
+        for name, (frames, code) in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(len(frames), 1)
+                frame = frames[0]
+                self.assertEqual(frame["metadata"], {"budget_error_code": code})
+                self.assertNotIn("credentials_error_code", json.dumps(frame))
+                self.assertEqual((frame["type"], frame["content"]), ("logs", "error"))
+                self.assertNotIn(SECRET_MARK, json.dumps(frame))
+
+    async def test_credential_only_failure_still_reports_credentials_code(self):
+        async def start(websocket, data, manager):
+            async def research(task, headers=None):
+                self.withdraw_tavily()
+                credentials.provider_key("tavily-chat", None)
+            owned = Mock(aclose=AsyncMock())  # Budget not denied.
+            with patch.object(self.scope, "ResearchBudget", return_value=owned):
+                await credentials.with_research_credentials(self.scope.with_research_budget(research))(
+                    "t", headers={"nevel_budget": {"capability": self.capability}})
+
+        frames = await self.socket_frames(start)
+        self.assertEqual(frames, [{"type": "logs", "content": "error", "output": "Research credentials unavailable",
+                                   "metadata": {"credentials_error_code": "credentials_unavailable"}}])
+
+
 def load_functions(path, names, namespace):
     tree = ast.parse(path.read_text())
     nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
@@ -917,7 +1069,8 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
                      "traceback": traceback,
                      "verify_budget_start": verify or Mock(), "handle_start_command": start,
                      "credential_start_error": credentials.start_error, "find_credential_error": credentials.find_credential_error,
-                     "find_budget_error": lambda error: None}
+                     "find_budget_error": lambda error: None, "find_in_chain": credentials.find_in_chain,
+                     "ResearchBudgetError": budget_transport.ResearchBudgetError}
         communicate, _ = load_functions(self.utils, ["handle_websocket_communication", "_start_headers"], namespace)
         messages = [data]
 
