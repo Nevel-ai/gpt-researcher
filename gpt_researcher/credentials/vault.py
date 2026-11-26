@@ -43,6 +43,9 @@ SOURCE_DOCUMENTS = {
 assert tuple(SOURCE_DOCUMENTS) == SOURCES
 
 _ROLE = re.compile(r"[a-z0-9][a-z0-9-]{0,127}")
+_TRANSPORT_SAFE = re.compile(r"[\x21-\x7e]+")
+# 2 ** 6 * (1 + JITTER) already exceeds MAX_RETRY_DELAY_S.
+_MAX_BACKOFF_EXPONENT = 6
 _LOG = logging.getLogger("gpt_researcher.credentials")
 
 
@@ -163,13 +166,20 @@ class VaultCredentials:
             except Exception:  # Never let the refresher die; classified errors are handled inside.
                 self._failures += 1
                 self._log.error("Research Vault refresh crashed")
-            self._stop.wait(self.next_delay())
+            try:
+                delay = self.next_delay()
+            except Exception:  # Same rule for the schedule: keep polling at the slowest retry pace.
+                delay = MAX_RETRY_DELAY_S
+            self._stop.wait(delay)
 
     def next_delay(self):
         spread = 1 + JITTER * (2 * self._rand() - 1)
         if not self._failures:
             return REFRESH_INTERVAL_S * spread
-        return min(MAX_RETRY_DELAY_S, 2.0 ** (self._failures - 1) * spread)
+        # The exponent is capped before evaluation: an outage of any length (any failure count) must keep the
+        # refresher alive at the 60 s ceiling, never overflow the float power.
+        exponent = min(self._failures - 1, _MAX_BACKOFF_EXPONENT)
+        return min(MAX_RETRY_DELAY_S, 2.0 ** exponent * spread)
 
     def refresh_once(self):
         """One login/renew step and one read of every source. Returns True when everything succeeded."""
@@ -288,7 +298,10 @@ class VaultCredentials:
         field = SOURCE_DOCUMENTS[source][1]
         value = fields.get(field) if isinstance(fields, dict) else None
         version = metadata.get("version") if isinstance(metadata, dict) else None
-        if not isinstance(value, str) or not value.strip() or len(value) > MAX_VALUE_LENGTH or value != value.strip() \
+        # Provider keys travel in HTTP Authorization headers and JSON bodies: only printable ASCII without spaces.
+        # Anything else (embedded newline/NUL/control, non-ASCII, whitespace) would replace a working key with
+        # one every request fails on, so it is rejected before it can be published.
+        if not isinstance(value, str) or not _TRANSPORT_SAFE.fullmatch(value) or len(value) > MAX_VALUE_LENGTH \
                 or type(version) is not int or version < 1:
             raise VaultError("VALIDATION", 200, field)
         return value, version

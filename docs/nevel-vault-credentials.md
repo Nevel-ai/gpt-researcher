@@ -40,7 +40,9 @@ The role needs exactly `read` on these three `kv/data/...` paths and `update` on
 - Vault's 404 or a deleted/destroyed version closes that source at once. A 403 on a read triggers one new login
   and a repeat; a 403 with the fresh token closes that source. A denied login closes all sources. A Kubernetes
   JWKS failure looks the same to Vault as a revocation.
-- A new version that fails validation is ignored; the accepted one keeps its original age.
+- A new version that fails validation is ignored; the accepted one keeps its original age. A value must be
+  printable ASCII without spaces or control characters (it travels in HTTP headers and JSON bodies).
+- The failure backoff is capped before it is computed, so an outage of any length keeps polling every 60 s.
 - The token is renewed at 60–70% of its TTL; a denied renewal, expiry or a lease capped by `token_max_ttl`
   leads to a new login.
 - HTTPS with certificate verification, no redirects, env proxies ignored, 5 s per request, responses limited to
@@ -54,7 +56,8 @@ The latest validated key is taken when a provider client is built, not on every 
 
 | Operation | Client lifetime | Effect of a rotation |
 |---|---|---|
-| OpenRouter / OpenAI chat completion | new `ChatOpenAI` per completion or tool call | next completion uses the new key |
+| OpenRouter / OpenAI chat completion | new `ChatOpenAI` per completion | next completion uses the new key |
+| Report chat with tools (`/api/chat`, `/api/reports/{id}/chat`) | tool-bound client checked before each paid invocation | the follow-up after tools is rebound to a rotated key; a withdrawn key ends the request before the follow-up, with no fallback completion |
 | Tavily search | key resolved for every search request | next search request |
 | Tavily extract, report chat search | client built per extraction / search | next extraction / search |
 | OpenAI embeddings | wrapper checks the key at every embedding call, rebuilds its client only when it changed | next embedding call |
@@ -77,6 +80,7 @@ After a revocation or deletion, the next client construction / embedding call fa
   `/ws/budget-v2` (after the existing budget capability check, which still closes invalid starts with 1008),
   `/report/`, `/api/multi_agents`, `/api/chat`, `/api/reports/{id}/chat`, and `run_agent` itself. Credentials
   lost during a run fail the run (`credentials_unavailable`) even where legacy code swallows provider errors.
+  Tool errors and the tool helper's fallback completion never absorb a credential failure.
 - WebSocket refusal: `{"type": "error", "output": ..., "metadata": {"credentials_error_code": ...}}`; HTTP: 503
   (unavailable) or 400 (override), `{"error", "code"}`.
 

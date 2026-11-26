@@ -300,6 +300,65 @@ class VaultProtocolTests(unittest.TestCase):
             delays.append(self.client.next_delay())
         self.assertEqual(delays, [1, 2, 4, 8, 16, 32, 60, 60])
 
+    def test_backoff_never_overflows_and_the_refresher_survives_a_long_outage(self):
+        self.client._rand = lambda: 1.0
+        for failures in (64, 1024, 1025, 1026, 10 ** 9):
+            self.client._failures = failures
+            self.assertEqual(self.client.next_delay(), 60)  # 2.0 ** 1024 used to raise OverflowError here.
+        self.client.refresh_once()
+        fetched = self.client._entries["openai-chat"].fetched
+        self.fake.down = True
+        self.client._failures = 1024  # About 17 hours of failures at the fast end of the backoff.
+        waits = []
+
+        class Stop:
+            """Drives the real refresher loop: each wait records the delay and advances the outage scenario."""
+
+            def is_set(stop):
+                return len(waits) >= 4
+
+            def set(stop):  # Called by close() during cleanup.
+                waits.extend([None] * 4)
+
+            def wait(stop, delay):
+                waits.append(delay)
+                self.clock.now += delay
+                if len(waits) == 2:
+                    self.fake.down = False  # Vault is back: the same thread must recover without a restart.
+
+        self.client._stop = Stop()
+        self.client._run()
+        self.assertEqual(waits[:2], [60, 60])
+        self.assertEqual(self.client._failures, 0)
+        self.assertAlmostEqual(waits[2], 15 * 1.2)  # Back to the normal polling interval.
+        self.assertGreater(self.client._entries["openai-chat"].fetched, fetched)
+        self.assertTrue(self.client.ready())
+
+    def test_transport_invalid_values_never_replace_the_key_or_refresh_its_timestamp(self):
+        self.client.refresh_once()
+        path = "providers/openrouter/dev/chat"
+        accepted = self.client._entries["openrouter-chat"]
+        good = value("OPENROUTER_API_KEY", 1)
+        for broken in ["sk-or-ok\nInjected: header", "sk-or-ok\r", "sk-\x00nul", "sk-\x7fdel", "sk or space",
+                       "sk-or-\u00e9", "sk-or-\u2028", "\tsk-or", "sk-or\n"]:
+            with self.subTest(value=repr(broken)):
+                self.fake.values[path] = {"OPENROUTER_API_KEY": broken}
+                self.fake.versions[path] += 1
+                self.clock.now += 60
+                self.assertFalse(self.client.refresh_once())
+                entry = self.client._entries["openrouter-chat"]
+                self.assertEqual(entry.credential.value, good)
+                self.assertEqual(entry.fetched, accepted.fetched)  # Polls returning the bad value do not renew it.
+                self.assertEqual(entry.credential.generation, accepted.credential.generation)
+        # The other sources keep refreshing normally while this one serves its last good key.
+        self.assertGreater(self.client._entries["tavily-chat"].fetched, accepted.fetched)
+        self.clock.now = accepted.fetched + vault.MAX_STALE_S
+        self.assertFalse(self.client.ready())  # Readiness turns red at the original 48 h, not later.
+        self.fake.set(path, value("OPENROUTER_API_KEY", 2))
+        self.client.refresh_once()
+        self.assertEqual(self.client.get("openrouter-chat").value, value("OPENROUTER_API_KEY", 2))
+        self.assertTrue(self.client.ready())
+
     def test_logs_and_errors_never_contain_values_tokens_or_jwts(self):
         with self.assertLogs("gpt_researcher.credentials", level="INFO") as logs:
             self.client.refresh_once()
@@ -619,6 +678,132 @@ class LongRunRotationTests(unittest.IsolatedAsyncioTestCase):
             operation.observe.assert_called_once_with(f"gen-{index + 1}")
             operation.finalize.assert_called_once_with("0.01")
         self.assertTrue(all(stream.closed for stream in streams))
+
+
+class ToolBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    """The real tool-calling helper and search tool: every paid invocation checks the managed key first."""
+
+    def setUp(self):
+        self.v = VaultFixture(self)
+        self.v.install(self)
+        self.v.client.refresh_once()
+        self.requests = []  # (call, key) of every model invocation that would be billed.
+        self.fallbacks = AsyncMock(return_value="fallback answer")
+        test = self
+
+        class Bound:
+            def __init__(self, key):
+                self.key = key
+
+            async def ainvoke(self, messages):
+                call = "first" if not any(isinstance(m, ToolMessage) for m in messages) else "follow-up"
+                test.requests.append((call, self.key))
+                if call == "first":
+                    return SimpleNamespace(content="", tool_calls=[{"name": "search_tool", "args": {"query": "q"}, "id": "t1"}])
+                return SimpleNamespace(content="final answer", tool_calls=[])
+
+        class FakeChatOpenAI:
+            def __init__(self, openai_api_key, **kwargs):
+                self.key = openai_api_key
+
+            def bind_tools(self, tools):
+                return Bound(self.key)
+
+        class Message:
+            def __init__(self, content=None, **kwargs):
+                self.content = content
+
+        class ToolMessage(Message):
+            pass
+
+        def tool(function):
+            # Shape of a LangChain @tool: named, invoked with its argument mapping.
+            return SimpleNamespace(name=function.__name__, invoke=lambda args: function(**args))
+
+        packages = {}
+        for name in ("tools_fixture", "tools_fixture.utils", "tools_fixture.llm_provider", "tools_fixture.llm_provider.generic"):
+            packages[name] = ModuleType(name)
+            packages[name].__path__ = []
+        modules = patch.dict(sys.modules, {
+            **packages,
+            "tools_fixture.utils.llm": SimpleNamespace(create_chat_completion=self.fallbacks),
+            "tools_fixture.llm_provider.generic.base": provider_module,
+            "langchain_core.messages": SimpleNamespace(HumanMessage=Message, SystemMessage=Message, AIMessage=Message, ToolMessage=ToolMessage),
+            "langchain_core.tools": SimpleNamespace(tool=tool),
+            "gpt_researcher.utils.budget": SimpleNamespace(current_research_budget=SimpleNamespace(get=lambda: None),
+                                                           ResearchBudgetError=budget_transport.ResearchBudgetError),
+            "langchain_openai": SimpleNamespace(ChatOpenAI=FakeChatOpenAI),
+            "langchain_core.rate_limiters": SimpleNamespace(InMemoryRateLimiter=Mock()),
+        })
+        modules.start()
+        self.addCleanup(modules.stop)
+        check = patch.object(provider_module, "_check_pkg")
+        check.start()
+        self.addCleanup(check.stop)
+        spec = importlib.util.spec_from_file_location("tools_fixture.utils.tools", ROOT / "gpt_researcher/utils/tools.py")
+        self.tools = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.tools)
+
+    async def chat(self, search):
+        return await self.tools.create_chat_completion_with_tools(
+            messages=[{"role": "user", "content": "question"}], tools=[self.tools.create_search_tool(search)],
+            model="gpt-4o-mini", llm_provider="openrouter")
+
+    def rotate(self, path, version):
+        self.v.fake.set(path, value(DOCS[path][0], version))
+        self.v.client.refresh_once()
+
+    async def test_follow_up_after_tools_uses_the_key_rotated_during_tool_execution(self):
+        def search(query):
+            self.rotate("providers/openrouter/dev/chat", 2)  # The background reader accepts a rotation meanwhile.
+            return {"results": [{"title": "t", "content": "c", "url": "u"}]}
+
+        self.assertEqual(await self.chat(search), ("final answer", [{
+            "tool": "search_tool", "args": {"query": "q"}, "call_id": "t1", "result": ANY_RESULT}]))
+        self.assertEqual(self.requests, [("first", value("OPENROUTER_API_KEY", 1)), ("follow-up", value("OPENROUTER_API_KEY", 2))])
+        self.fallbacks.assert_not_called()
+
+    async def test_key_withdrawn_during_tool_execution_sends_no_follow_up_and_no_fallback(self):
+        def search(query):
+            self.v.fake.overrides["providers/openrouter/dev/chat"] = lambda: httpx.Response(404, json={"errors": []})
+            self.v.client.refresh_once()
+            return {"results": []}
+
+        with self.assertRaises(CredentialUnavailableError):
+            await self.chat(search)
+        self.assertEqual(self.requests, [("first", value("OPENROUTER_API_KEY", 1))])  # No paid follow-up on the old key.
+        self.fallbacks.assert_not_called()  # The fallback would be another paid completion.
+
+    async def test_tool_credential_failure_propagates_instead_of_becoming_tool_text(self):
+        def search(query):
+            raise CredentialUnavailableError("tavily-chat")
+
+        with self.assertRaises(CredentialUnavailableError):
+            await self.chat(search)
+        self.assertEqual(self.requests, [("first", value("OPENROUTER_API_KEY", 1))])
+        self.fallbacks.assert_not_called()
+
+    async def test_ordinary_tool_errors_and_env_mode_keep_upstream_behaviour(self):
+        def search(query):
+            raise RuntimeError("search backend down")
+
+        response, metadata = await self.chat(search)
+        self.assertEqual(response, "final answer")
+        self.assertIn("Search error: search backend down", metadata[0]["result"])
+        self.assertEqual([call for call, _ in self.requests], ["first", "follow-up"])
+        self.requests.clear()
+        credentials._state = (os.getpid(), "env", None)
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "env-copy"}):
+            self.assertEqual((await self.chat(lambda query: {"results": []}))[0], "final answer")
+        self.assertEqual(self.requests, [("first", "env-copy"), ("follow-up", "env-copy")])
+
+
+class _AnyResult:
+    def __eq__(self, other):
+        return isinstance(other, str)
+
+
+ANY_RESULT = _AnyResult()
 
 
 def load_functions(path, names, namespace):
