@@ -559,10 +559,66 @@ class CallSiteTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(provider=provider, kwargs=kwargs), self.assertRaises(CredentialPolicyError):
                     self.build(provider, **kwargs)
 
+    AUTH_NAMES = ("Authorization", "authorization", "AUTHORIZATION", "aUtHoRiZaTiOn", " Authorization ", b"Authorization",
+                  "Api-Key", "X-API-KEY", "x-api-key")
+
+    def test_per_request_auth_headers_cannot_replace_the_managed_key(self):
+        # LLM_KWARGS / EMBEDDING_KWARGS are JSON objects; LangChain sends model_kwargs (and unknown top-level kwargs it
+        # moves there, such as extra_headers) with every request, where the SDK lets them override its bearer header.
+        for name in self.AUTH_NAMES:
+            headers = {"X-Title": "benign", name: "Bearer other"}
+            for kwargs in ({"model_kwargs": {"extra_headers": headers}}, {"extra_headers": headers},
+                           {"default_headers": headers}, {"model_kwargs": {"top_p": 1, "extra_headers": headers}}):
+                for provider in ("openrouter", "openai"):
+                    with self.subTest(provider=provider, kwargs=kwargs), \
+                            patch.object(credentials, "provider_key", wraps=credentials.provider_key) as key, \
+                            self.assertRaises(CredentialPolicyError):
+                        self.build(provider, **kwargs)
+                    key.assert_not_called()  # Refused before the managed key is read or a client is built.
+        for malformed in ({"model_kwargs": "x"}, {"model_kwargs": {"extra_headers": [("Authorization", "Bearer other")]}},
+                          {"extra_headers": [("Authorization", "Bearer other")]}):
+            with self.subTest(malformed=malformed), self.assertRaises(CredentialPolicyError):
+                self.build("openrouter", **malformed)
+
+    def test_benign_headers_and_options_still_reach_the_managed_client(self):
+        kwargs = {"default_headers": {"HTTP-Referer": "https://nevel.ai", "X-Title": "Nevel"},
+                  "model_kwargs": {"top_p": 0.5, "extra_headers": {"X-Request-Tag": "a", "OpenAI-Beta": "b"},
+                                   "extra_body": {"provider": {"sort": "price"}}},
+                  "extra_headers": {"X-Other": "c"}}
+        built = self.build("openrouter", **json.loads(json.dumps(kwargs)))
+        self.assertEqual(built["openai_api_key"], value("OPENROUTER_API_KEY", 1))
+        for name in kwargs:
+            self.assertEqual(built[name], kwargs[name])
+
+    def test_embedding_kwargs_cannot_carry_auth_headers(self):
+        built = []
+
+        class FakeEmbeddings:
+            def __init__(self, model, openai_api_key, **kwargs):
+                built.append(kwargs)
+
+            def embed_query(self, text):
+                return [0.0]
+
+        module = self.load("gpt_researcher/memory/embeddings.py", "embeddings_header_fixture")
+        with patch.dict(sys.modules, {"gpt_researcher.utils.budget": self.no_budget,
+                                      "langchain_openai": SimpleNamespace(OpenAIEmbeddings=FakeEmbeddings),
+                                      "langchain_core.embeddings": SimpleNamespace(Embeddings=type("E", (), {}))}):
+            for kwargs in ({"model_kwargs": {"extra_headers": {"AUTHORIZATION": "Bearer other"}}},
+                           {"extra_headers": {"api-key": "other"}}):
+                with self.subTest(kwargs=kwargs), self.assertRaises(CredentialPolicyError):
+                    module.Memory("openai", "text-embedding-3-small", **kwargs)
+            benign = {"model_kwargs": {"extra_headers": {"X-Title": "Nevel"}}}
+            module.Memory("openai", "text-embedding-3-small", **benign).get_embeddings().embed_query("q")
+        self.assertEqual(built, [benign])
+
     def test_env_mode_provider_factory_is_unchanged(self):
         credentials._state = (os.getpid(), "env", None)
         self.assertEqual(self.build("openrouter")["openai_api_key"], "env-copy")
         self.assertNotIn("openai_api_key", self.build("openai"))  # LangChain reads its env as upstream does.
+        legacy = {"model_kwargs": {"extra_headers": {"Authorization": "Bearer manual"}},
+                  "default_headers": {"Authorization": "Bearer manual"}}
+        self.assertEqual(self.build("openrouter", **legacy)["model_kwargs"], legacy["model_kwargs"])  # Upstream override.
 
     def load(self, relative, name, extra=None):
         spec = importlib.util.spec_from_file_location(name, ROOT / relative)

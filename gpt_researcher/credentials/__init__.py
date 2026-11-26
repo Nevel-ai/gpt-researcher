@@ -18,6 +18,7 @@ import contextvars
 import inspect
 import os
 import threading
+from collections.abc import Mapping
 from functools import wraps
 
 from .errors import (
@@ -184,15 +185,40 @@ def reject_credential_headers(headers):
         raise CredentialPolicyError()
 
 
+_AUTH_HEADERS = {"authorization", "api-key", "x-api-key"}
+
+
+def _auth_header(name):
+    if isinstance(name, bytes):
+        name = name.decode("latin-1")
+    return str(name).strip().lower() in _AUTH_HEADERS
+
+
+def _rejects_headers(headers):
+    """Header names are case-insensitive on the wire; an unreadable header collection fails closed."""
+    if headers is None:
+        return False
+    if not isinstance(headers, Mapping):
+        return True
+    return any(_auth_header(name) for name in headers)
+
+
 def reject_credential_kwargs(kwargs):
-    """Vault mode: configured client kwargs must not replace the managed key or its auth header."""
+    """Vault mode: configured client kwargs must not replace the managed key or its auth header.
+
+    The OpenAI SDK lets both client defaults (`default_headers`) and per-request options (`extra_headers`) override
+    the bearer header it builds from the key. LangChain sends `model_kwargs` (and moves unknown top-level kwargs such
+    as `extra_headers` there) into every request, so all three places are checked. Other headers and options pass.
+    """
     if not vault_mode():
         return
     if any(name in kwargs for name in ("openai_api_key", "api_key")):
         raise CredentialPolicyError()
-    default_headers = kwargs.get("default_headers")
-    if isinstance(default_headers, dict) and any(str(name).lower() in {"authorization", "api-key", "x-api-key"}
-                                                 for name in default_headers):
+    model_kwargs = kwargs.get("model_kwargs")
+    if model_kwargs is not None and not isinstance(model_kwargs, Mapping):
+        raise CredentialPolicyError()
+    if any(_rejects_headers(headers) for headers in (
+            kwargs.get("default_headers"), kwargs.get("extra_headers"), (model_kwargs or {}).get("extra_headers"))):
         raise CredentialPolicyError()
 
 
