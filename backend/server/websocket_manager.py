@@ -11,6 +11,7 @@ from report_type import BasicReport, DetailedReport
 
 from gpt_researcher.utils.enum import ReportType, Tone
 from gpt_researcher.utils.budget_scope import with_research_budget
+from gpt_researcher.credentials import with_research_credentials
 from gpt_researcher.actions import stream_output  # Import stream_output
 from .server_utils import CustomLogsHandler
 
@@ -110,6 +111,8 @@ class WebSocketManager:
         )
         return report
 
+# Credentials gate first: no budget scope or paid call starts without the provider keys.
+@with_research_credentials
 @with_research_budget
 async def run_agent(task, report_type, report_source, source_urls, document_urls, tone: Tone, websocket, stream_output=stream_output, headers=None, query_domains=[], config_path="", return_researcher=False, mcp_enabled=False, mcp_strategy="fast", mcp_configs=[]):
     """Run the agent."""    

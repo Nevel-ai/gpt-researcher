@@ -167,11 +167,16 @@ class GenericLLMProvider:
         if provider == "openai":
             _check_pkg("langchain_openai")
             from langchain_openai import ChatOpenAI
+            from gpt_researcher.credentials import provider_key, reject_credential_kwargs, vault_mode
 
             # Support custom OpenAI-compatible APIs via OPENAI_BASE_URL
             if "openai_api_base" not in kwargs and os.environ.get("OPENAI_BASE_URL"):
                 kwargs["openai_api_base"] = os.environ["OPENAI_BASE_URL"]
 
+            if vault_mode():
+                # The managed key for this client only; LangChain must never read the env copy.
+                reject_credential_kwargs(kwargs)
+                kwargs["openai_api_key"] = provider_key("openai-chat", None)
             llm = ChatOpenAI(**kwargs)
         elif provider == "anthropic":
             _check_pkg("langchain_anthropic")
@@ -280,6 +285,12 @@ class GenericLLMProvider:
             _check_pkg("langchain_openai")
             from langchain_openai import ChatOpenAI
             from langchain_core.rate_limiters import InMemoryRateLimiter
+            from gpt_researcher.credentials import provider_key, reject_credential_kwargs
+
+            # Resolved for this client: a client built after a rotation gets the new key, while a stream
+            # already running keeps the client (and key) it started with.
+            reject_credential_kwargs(kwargs)
+            api_key = provider_key("openrouter-chat", lambda: os.environ["OPENROUTER_API_KEY"])
 
             tracking = kwargs.pop("nevel_tracking", None)
             extra_body = _build_openrouter_extra_body(tracking)
@@ -299,7 +310,7 @@ class GenericLLMProvider:
             )
 
             llm = ChatOpenAI(openai_api_base='https://openrouter.ai/api/v1',
-                     openai_api_key=os.environ["OPENROUTER_API_KEY"],
+                     openai_api_key=api_key,
                      rate_limiter=rate_limiter,
                      **kwargs
                 )

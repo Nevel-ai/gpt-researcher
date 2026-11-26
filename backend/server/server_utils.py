@@ -10,7 +10,8 @@ from typing import Awaitable, Dict, List, Any
 from fastapi.responses import JSONResponse, FileResponse
 from gpt_researcher.document.document import DocumentLoader
 from gpt_researcher import GPTResearcher
-from gpt_researcher.utils.budget import find_budget_error
+from gpt_researcher.utils.budget import ResearchBudgetError, find_budget_error
+from gpt_researcher.credentials import find_credential_error, find_in_chain, start_error as credential_start_error
 from gpt_researcher.utils.budget_scope import verify_budget_start
 from utils import write_md_to_pdf, write_md_to_word, write_text_to_md
 from pathlib import Path
@@ -274,6 +275,9 @@ async def handle_file_deletion(filename: str, DOC_PATH: str) -> JSONResponse:
 
 
 async def execute_multi_agents(manager) -> Any:
+    refusal = credential_start_error()
+    if refusal:
+        return JSONResponse(status_code=503, content=refusal)
     websocket = manager.active_connections[0] if manager.active_connections else None
     if websocket:
         report = await run_research_task(
@@ -297,7 +301,18 @@ async def handle_websocket_communication(websocket, manager, require_budget=Fals
                 logger.info("Task cancelled.")
                 raise
             except Exception as e:
-                budget_error = find_budget_error(e)
+                # Budget classification first, anywhere in the chain: Chat maps it to exhausted/reconciliation.
+                budget_error = find_budget_error(e) or find_in_chain(e, ResearchBudgetError)
+                credential_error = None if budget_error else find_credential_error(e)
+                if credential_error:
+                    # Sanitized: no provider/Vault details, never a credential value.
+                    logger.warning("Research stopped: %s", credential_error.code)
+                    await websocket.send_json({
+                        "type": "logs", "content": "error",
+                        "output": str(credential_error),
+                        "metadata": {"credentials_error_code": credential_error.code},
+                    })
+                    return
                 if budget_error:
                     logger.warning("Research stopped by budget policy: %s", budget_error.code)
                 else:
@@ -342,6 +357,12 @@ async def handle_websocket_communication(websocket, manager, require_budget=Fals
                             await websocket.send_json({"type": "error", "metadata": {"budget_error_code": "budget_invalid_transition"}})
                             await websocket.close(code=1008)
                             return
+                    refusal = credential_start_error(_start_headers(data))
+                    if refusal:
+                        # Before budget scoping or any paid call; the connection and its protocol stay as they are.
+                        await websocket.send_json({"type": "error", "content": "error", "output": refusal["error"],
+                                                   "metadata": {"credentials_error_code": refusal["code"]}})
+                        continue
                     logger.info(f"Processing start command")
                     running_task = run_long_running_task(
                         handle_start_command(websocket, data, manager)
@@ -371,6 +392,14 @@ async def handle_websocket_communication(websocket, manager, require_budget=Fals
     finally:
         if running_task and not running_task.done():
             running_task.cancel()
+
+
+def _start_headers(data: str):
+    try:
+        headers = json.loads(data.strip()[6:]).get("headers")
+    except Exception:
+        return None
+    return headers if isinstance(headers, dict) else None
 
 
 def extract_command_data(json_data: Dict) -> tuple:

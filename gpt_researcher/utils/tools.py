@@ -12,7 +12,11 @@ from typing import Any, Dict, List, Tuple, Callable, Optional
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.tools import tool
 
+from gpt_researcher.credentials import find_credential_error, provider_credential, vault_mode
 from .llm import create_chat_completion
+
+# LLM providers whose key is managed by the Vault credential source (gpt_researcher.credentials).
+_MANAGED_LLM_SOURCES = {"openrouter": "openrouter-chat", "openai": "openai-chat"}
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +71,22 @@ async def create_chat_completion_with_tools(
         if nevel_tracking:
             provider_kwargs["nevel_tracking"] = nevel_tracking
 
-        llm_provider_instance = GenericLLMProvider.from_provider(
-            llm_provider, 
-            **provider_kwargs
-        )
+        managed = _MANAGED_LLM_SOURCES.get(llm_provider) if vault_mode() else None
+        bound = {"generation": None, "llm": None}
+
+        def current_llm():
+            """The tool-bound client for the next paid invocation, never older than the accepted key.
+
+            Each invocation (first completion, follow-up after tools) checks the managed key first: an unavailable
+            or revoked key fails here, before a request is sent; a rotated key rebuilds and rebinds the client.
+            Outside Vault mode the first bound client is reused exactly as before.
+            """
+            generation = provider_credential(managed).generation if managed else None
+            if bound["llm"] is None or generation != bound["generation"]:
+                instance = GenericLLMProvider.from_provider(llm_provider, **provider_kwargs)
+                bound["llm"] = instance.llm.bind_tools(tools)
+                bound["generation"] = generation
+            return bound["llm"]
         
         # Convert messages to LangChain format
         lc_messages = []
@@ -83,7 +99,7 @@ async def create_chat_completion_with_tools(
                 lc_messages.append(AIMessage(content=msg["content"]))
         
         # Bind tools to the LLM - this works across all LangChain providers that support function calling
-        llm_with_tools = llm_provider_instance.llm.bind_tools(tools)
+        llm_with_tools = current_llm()
         
         # Invoke the LLM with tools - this will handle the full conversation flow
         logger.info(f"Invoking LLM with {len(tools)} available tools")
@@ -126,6 +142,8 @@ async def create_chat_completion_with_tools(
                                 tool_result = await tool(**tool_args) if asyncio.iscoroutinefunction(tool) else tool(**tool_args)
                             break
                         except Exception as e:
+                            if find_credential_error(e):
+                                raise  # Fail closed: never answer from a tool that lost its credential.
                             logger.error(f"Error executing tool {tool_name}: {e}")
                             tool_result = f"Tool error: {str(e)}"
                 
@@ -143,7 +161,7 @@ async def create_chat_completion_with_tools(
             
             # Get final response from LLM after tool execution
             logger.info("Getting final response from LLM after tool execution")
-            final_response = await llm_with_tools.ainvoke(lc_messages)
+            final_response = await current_llm().ainvoke(lc_messages)
             
             # Track costs if callback provided
             if cost_callback:
@@ -164,6 +182,9 @@ async def create_chat_completion_with_tools(
             return response.content, []
         
     except Exception as e:
+        if find_credential_error(e):
+            # The fallback would be another paid completion; a credential failure ends the request instead.
+            raise
         logger.error(f"Error in tool-enabled chat completion: {str(e)}")
         logger.info("Falling back to simple chat completion without tools")
         
@@ -207,6 +228,8 @@ def create_search_tool(search_function: Callable[[str], Dict]) -> Callable:
             else:
                 return f"No search results found for: {query}"
         except Exception as e:
+            if find_credential_error(e):
+                raise
             logger.error(f"Search tool error: {str(e)}")
             return f"Search error: {str(e)}"
     
@@ -237,6 +260,8 @@ def create_custom_tool(
             result = function(*args, **kwargs)
             return str(result) if result is not None else "Tool executed successfully"
         except Exception as e:
+            if find_credential_error(e):
+                raise
             logger.error(f"Custom tool '{name}' error: {str(e)}")
             return f"Tool error: {str(e)}"
     

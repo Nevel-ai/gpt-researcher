@@ -12,6 +12,7 @@ from gpt_researcher.config.config import Config
 from gpt_researcher.utils.llm import create_chat_completion
 from gpt_researcher.utils.tools import create_chat_completion_with_tools, create_search_tool
 from tavily import TavilyClient
+from gpt_researcher.credentials import CredentialUnavailableError, provider_key, vault_mode
 from datetime import datetime
 
 # Setup logging
@@ -67,8 +68,8 @@ class ChatAgentWithMemory:
         self.retriever = None
         self.search_metadata = None
         
-        # Initialize Tavily client
-        self.tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
+        # Initialize Tavily client. With Vault credentials a client is built per search with the current key.
+        self.tavily_client = None if vault_mode() else TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
         
         # Process document and create vector store if not provided
         if not self.vector_store and False:
@@ -110,7 +111,8 @@ class ChatAgentWithMemory:
         """Perform a web search for current information using Tavily"""
         try:
             logger.info(f"Performing web search for: {query}")
-            results = self.tavily_client.search(query=query, max_results=5)
+            client = self.tavily_client or TavilyClient(api_key=provider_key("tavily-chat", None))
+            results = client.search(query=query, max_results=5)
             
             # Store search metadata for frontend
             self.search_metadata = {
@@ -124,6 +126,8 @@ class ChatAgentWithMemory:
             }
             
             return results
+        except CredentialUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"Error performing web search: {str(e)}", exc_info=True)
             return {
