@@ -9,6 +9,7 @@ Applies to the Nevel fork only. Code: `gpt_researcher/credentials/`. Tests: `tes
 | Value | Behaviour |
 |---|---|
 | unset or `env` | Upstream behaviour. Every call site reads its env variable as before; no Vault client, thread or request. Request headers may still carry `tavily_api_key`/`google_api_key` as upstream allows. |
+| `env` with `CHAT_CONFIG_VAULT_ENV` set (Nevel chart, manual mode) | As above, but `/ready` and every business entrypoint also require `OPENROUTER_API_KEY`, `OPENAI_API_KEY` and `TAVILY_API_KEY` to be present and transport-safe (printable ASCII, no whitespace/control, ≤4096). Otherwise not Ready, `credentials_unavailable`, no paid work. Still no Vault request and no switch to Vault. The chart delivers them only through the operator-owned optional Secret `gpt-researcher-manual-credentials`. An invalid `CHAT_CONFIG_VAULT_ENV` (not dev/prod) fails startup. |
 | `vault` | `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `TAVILY_API_KEY` come only from Vault. Env copies are ignored and never a fallback. Request headers or configured client kwargs that carry a credential are rejected (`credential_override_forbidden`). The `custom` embedding provider is refused because it would read the env copy. |
 | anything else | The worker fails at startup. |
 

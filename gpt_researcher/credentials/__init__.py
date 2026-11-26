@@ -1,8 +1,11 @@
 """Provider credentials of the Nevel deployment: OpenRouter, OpenAI and Tavily.
 
 `CHAT_CONFIG_CREDENTIAL_SOURCE` (the same switch as Chat's Node processes) selects the source once per process:
-- unset or `env`: the original upstream behaviour; every call site reads its env variable as before and Vault is
-  never contacted (no client, no thread, no import of the Vault module);
+- unset or `env`: every call site reads its env variable as before and Vault is never contacted (no client, no thread,
+  no import of the Vault module). In a configured Nevel workload (`CHAT_CONFIG_VAULT_ENV` set, which the chart
+  always does when the Researcher Vault block is enabled) env mode is the manual mode: readiness and every business
+  entrypoint additionally require all three keys to be present and transport-safe. Without that variable the
+  upstream behaviour is unchanged;
 - `vault`: OpenRouter/OpenAI/Tavily keys come only from Vault (`CHAT_CONFIG_VAULT_ENV`, `CHAT_CONFIG_VAULT_ROLE`);
   their env copies are ignored and are never a fallback;
 - anything else fails at startup. There is no automatic switching in either direction.
@@ -18,7 +21,7 @@ import threading
 from functools import wraps
 
 from .errors import (
-    SOURCES, CredentialConfigError, CredentialPolicyError, CredentialUnavailableError, find_credential_error,
+    SOURCE_FIELDS, SOURCES, transport_safe, CredentialConfigError, CredentialPolicyError, CredentialUnavailableError, find_credential_error,
     find_in_chain, find_research_budget_error,
 )
 
@@ -49,6 +52,16 @@ def credential_mode(environ=None):
     raise CredentialConfigError(f"{MODE_ENV} must be vault or env")
 
 
+def _managed_workload(environ):
+    """A configured Nevel Researcher (chart-provided environment) rather than an upstream/local installation."""
+    value = environ.get(ENVIRONMENT_ENV)
+    if value is None:
+        return False
+    if value not in ("dev", "prod"):
+        raise CredentialConfigError(f"{ENVIRONMENT_ENV} must be dev or prod")
+    return True
+
+
 def start(environ=None, **client_options):
     """Select the mode for this process and, in Vault mode, start its background reader.
 
@@ -57,12 +70,13 @@ def start(environ=None, **client_options):
     global _state
     environ = os.environ if environ is None else environ
     mode = credential_mode(environ)
+    strict = _managed_workload(environ)
     client = None
     if mode == "vault":
         from .vault import VaultCredentials
         client = VaultCredentials(environ.get(ENVIRONMENT_ENV), environ.get(ROLE_ENV), **client_options)
     with _lock:
-        previous, _state = _state, (os.getpid(), mode, client)
+        previous, _state = _state, (os.getpid(), mode, client, strict)
     if previous is not None and previous[2] is not None:
         previous[2].close()
     if client is not None:
@@ -85,6 +99,24 @@ def _active():
     # Not started in this process (library/CLI use or a forked child): the mode still applies, and Vault mode
     # without its own started client has no credentials rather than falling back to env.
     return credential_mode(), None
+
+
+def _strict_env():
+    state = _state
+    if state is not None and state[0] == os.getpid() and len(state) > 3:
+        return state[3]
+    return _managed_workload(os.environ)
+
+
+def _env_unavailable():
+    """Manual env mode of a configured workload: the first source whose env copy is missing or unusable.
+
+    Reads the process env only (no Vault, no polling). Values are checked, never logged or returned.
+    """
+    for source in SOURCES:
+        if not transport_safe(os.environ.get(SOURCE_FIELDS[source])):
+            return source
+    return None
 
 
 def vault_mode():
@@ -118,11 +150,18 @@ def provider_key(source, legacy):
 
 def readiness():
     mode, client = _active()
-    return {"mode": mode, "ready": mode == "env" or (client is not None and client.ready())}
+    if mode == "env":
+        return {"mode": mode, "ready": not _strict_env() or _env_unavailable() is None}
+    return {"mode": mode, "ready": client is not None and client.ready()}
 
 
 def require_ready():
     mode, client = _active()
+    if mode == "env":
+        missing = _env_unavailable() if _strict_env() else None
+        if missing is not None:
+            raise CredentialUnavailableError(missing)  # No automatic switch to Vault either.
+        return
     if mode == "vault":
         for source in SOURCES:
             if client is None:

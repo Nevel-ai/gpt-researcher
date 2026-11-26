@@ -423,6 +423,70 @@ class ModeTests(unittest.TestCase):
         self.assertFalse(client.ready())  # Closing drops the in-memory values.
 
 
+MANUAL_KEYS = {"OPENROUTER_API_KEY": "sk-or-" + SECRET_MARK, "OPENAI_API_KEY": "sk-" + SECRET_MARK,
+               "TAVILY_API_KEY": "tvly-" + SECRET_MARK}
+
+
+class ManualEnvModeTests(unittest.IsolatedAsyncioTestCase):
+    """Env mode of a configured Nevel Researcher (CHAT_CONFIG_VAULT_ENV set): the manual mode must be complete."""
+
+    def setUp(self):
+        previous = credentials._state
+        self.addCleanup(setattr, credentials, "_state", previous)
+        credentials._state = None
+        constructor = patch.object(vault, "VaultCredentials", side_effect=AssertionError("env mode must not build a Vault client"))
+        constructor.start()
+        self.addCleanup(constructor.stop)
+
+    def configure(self, keys, managed=True, mode="env"):
+        environ = {**({"CHAT_CONFIG_CREDENTIAL_SOURCE": mode} if mode else {}), **keys}
+        if managed:
+            environ.update(CHAT_CONFIG_VAULT_ENV="prod", CHAT_CONFIG_VAULT_ROLE="chat-prod-gpt-researcher")
+        environment = patch.dict(os.environ, environ, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.assertEqual(credentials.start(), "env")
+
+    async def test_complete_manual_keys_are_ready_and_used_as_before(self):
+        self.configure(MANUAL_KEYS)
+        self.assertEqual(credentials.readiness(), {"mode": "env", "ready": True})
+        self.assertIsNone(credentials.start_error())
+        credentials.require_ready()
+        self.assertEqual(credentials.provider_key("tavily-chat", lambda: os.environ["TAVILY_API_KEY"]), MANUAL_KEYS["TAVILY_API_KEY"])
+
+    async def test_missing_or_malformed_manual_keys_are_not_ready_and_start_no_work(self):
+        cases = {name: {k: v for k, v in MANUAL_KEYS.items() if k != name} for name in MANUAL_KEYS}
+        for name, broken in [("OPENAI_API_KEY", ""), ("OPENAI_API_KEY", "sk-ok\n"), ("OPENROUTER_API_KEY", "sk or space"),
+                             ("TAVILY_API_KEY", "tvly-\u00e9"), ("TAVILY_API_KEY", "x" * 4097), ("OPENROUTER_API_KEY", "a\tb")]:
+            cases[f"{name}={broken[:8]!r}"] = {**MANUAL_KEYS, name: broken}
+        for label, keys in cases.items():
+            with self.subTest(case=label):
+                self.configure(keys)
+                self.assertEqual(credentials.readiness(), {"mode": "env", "ready": False})
+                refusal = credentials.start_error()
+                self.assertEqual(refusal, {"error": "Research credentials unavailable", "code": "credentials_unavailable"})
+                body = AsyncMock()
+
+                async def research(task, headers=None):
+                    await body()
+
+                with self.assertRaises(CredentialUnavailableError):
+                    await credentials.with_research_credentials(research)("task", headers={})
+                body.assert_not_called()  # No paid work starts, and nothing switches to Vault.
+                self.assertNotIn(SECRET_MARK, json.dumps(refusal))
+
+    async def test_upstream_env_mode_without_a_nevel_environment_is_unchanged(self):
+        for mode in (None, "env"):
+            with self.subTest(mode=mode):
+                self.configure({}, managed=False, mode=mode)
+                self.assertEqual(credentials.readiness(), {"mode": "env", "ready": True})
+                self.assertIsNone(credentials.start_error())
+
+    def test_invalid_nevel_environment_fails_at_startup(self):
+        with patch.dict(os.environ, {"CHAT_CONFIG_VAULT_ENV": "staging"}, clear=True), self.assertRaises(CredentialConfigError):
+            credentials.start()
+
+
 def threading_wait(seconds):
     import threading
     threading.Event().wait(seconds)

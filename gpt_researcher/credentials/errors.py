@@ -1,7 +1,18 @@
 """Credential errors. Messages and attributes never contain credential values."""
+import re
 import sys
 
 SOURCES = ("openrouter-chat", "openai-chat", "tavily-chat")
+# Env name / Vault field of each source (the same name in both places).
+SOURCE_FIELDS = {"openrouter-chat": "OPENROUTER_API_KEY", "openai-chat": "OPENAI_API_KEY", "tavily-chat": "TAVILY_API_KEY"}
+MAX_VALUE_LENGTH = 4096
+# Provider keys travel in HTTP Authorization headers and JSON bodies: only printable ASCII without spaces.
+_TRANSPORT_SAFE = re.compile(r"[\x21-\x7e]+")
+
+
+def transport_safe(value):
+    """True for a usable provider key: printable ASCII, no whitespace or control characters, bounded length."""
+    return isinstance(value, str) and len(value) <= MAX_VALUE_LENGTH and _TRANSPORT_SAFE.fullmatch(value) is not None
 
 
 class CredentialConfigError(RuntimeError):

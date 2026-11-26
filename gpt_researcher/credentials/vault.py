@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .errors import SOURCES, CredentialConfigError, CredentialUnavailableError
+from .errors import MAX_VALUE_LENGTH, SOURCE_FIELDS, SOURCES, CredentialConfigError, CredentialUnavailableError, transport_safe
 
 VAULT_ADDRESS = "https://vault.nevel.ai"
 TOKEN_FILE = "/var/run/nevel-vault/token"
@@ -32,7 +32,6 @@ MAX_STALE_S = 172_800.0
 REQUEST_TIMEOUT_S = 5.0
 MAX_RESPONSE_BYTES = 1 << 20
 MAX_JWT_BYTES = 16_384
-MAX_VALUE_LENGTH = 4096
 
 # Existing provider documents shared with Chat; the Researcher reads one field of each.
 SOURCE_DOCUMENTS = {
@@ -40,10 +39,9 @@ SOURCE_DOCUMENTS = {
     "openai-chat": ("providers/openai/{env}/chat", "OPENAI_API_KEY"),
     "tavily-chat": ("providers/tavily/{env}/chat", "TAVILY_API_KEY"),
 }
-assert tuple(SOURCE_DOCUMENTS) == SOURCES
+assert tuple(SOURCE_DOCUMENTS) == SOURCES and all(SOURCE_FIELDS[name] == field for name, (_, field) in SOURCE_DOCUMENTS.items())
 
 _ROLE = re.compile(r"[a-z0-9][a-z0-9-]{0,127}")
-_TRANSPORT_SAFE = re.compile(r"[\x21-\x7e]+")
 # 2 ** 6 * (1 + JITTER) already exceeds MAX_RETRY_DELAY_S.
 _MAX_BACKOFF_EXPONENT = 6
 _LOG = logging.getLogger("gpt_researcher.credentials")
@@ -301,8 +299,7 @@ class VaultCredentials:
         # Provider keys travel in HTTP Authorization headers and JSON bodies: only printable ASCII without spaces.
         # Anything else (embedded newline/NUL/control, non-ASCII, whitespace) would replace a working key with
         # one every request fails on, so it is rejected before it can be published.
-        if not isinstance(value, str) or not _TRANSPORT_SAFE.fullmatch(value) or len(value) > MAX_VALUE_LENGTH \
-                or type(version) is not int or version < 1:
+        if not transport_safe(value) or type(version) is not int or version < 1:
             raise VaultError("VALIDATION", 200, field)
         return value, version
 
