@@ -2,6 +2,7 @@ import aiofiles
 import asyncio
 import importlib
 import json
+import logging
 import subprocess
 import sys
 import traceback
@@ -9,6 +10,8 @@ from typing import Any
 from colorama import Fore, Style, init
 import os
 from enum import Enum
+from contextlib import aclosing
+from gpt_researcher.utils.usage import extract_usage_report as _extract_usage_report
 
 _SUPPORTED_PROVIDERS = {
     "openai",
@@ -86,22 +89,94 @@ class ChatLogger:
                     "stacktrace": traceback.format_exc()
                 }) + "\n")
 
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _build_openrouter_extra_body(tracking: Any) -> dict[str, Any]:
+    if not isinstance(tracking, dict):
+        return {}
+
+    extra_body: dict[str, Any] = {
+        "usage": {"include": True},
+    }
+
+    trace = _as_dict(tracking.get("trace"))
+    if trace:
+        extra_body["trace"] = trace
+
+    user = tracking.get("user")
+    if isinstance(user, str) and user:
+        extra_body["user"] = user
+
+    session_id = tracking.get("session_id")
+    if isinstance(session_id, str) and session_id:
+        extra_body["session_id"] = session_id
+
+    return extra_body
+
+
+def _merge_extra_body(existing: Any, incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing) if isinstance(existing, dict) else {}
+
+    for key, value in incoming.items():
+        if key == "trace" and isinstance(value, dict):
+            merged[key] = {**_as_dict(merged.get(key)), **value}
+        elif key == "usage" and isinstance(value, dict):
+            merged[key] = {**_as_dict(merged.get(key)), **value}
+        else:
+            merged[key] = value
+
+    return merged
+
+
 class GenericLLMProvider:
 
-    def __init__(self, llm, chat_log: str | None = None,  verbose: bool = True):
+    def __init__(self, llm, chat_log: str | None = None,  verbose: bool = True, model_id: str | None = None):
         self.llm = llm
         self.chat_logger = ChatLogger(chat_log) if chat_log else None
         self.verbose = verbose
+        self.model_id = model_id
+
     @classmethod
     def from_provider(cls, provider: str, chat_log: str | None = None, verbose: bool=True, **kwargs: Any):
+        from gpt_researcher.utils.budget import current_research_budget, ResearchBudgetError
+        budget = current_research_budget.get()
+        if budget is not None:
+            if provider != "openrouter":
+                if budget.mode == "enforce":
+                    raise ResearchBudgetError("budget_invalid_transition")
+            else:
+                if "http_client" in kwargs or "http_async_client" in kwargs:
+                    if budget.mode == "enforce":
+                        raise ResearchBudgetError("budget_invalid_transition")
+                    logging.getLogger(__name__).warning("Shadow research custom HTTP client is not budget-instrumented")
+                else:
+                    proxy = kwargs.get("openai_proxy", os.getenv("OPENAI_PROXY"))
+                    kwargs.update(budget.http_clients(proxy=proxy))
+                    # Proxy is owned by the metered inner client. Prevent
+                    # LangChain from configuring another client from the env.
+                    kwargs["openai_proxy"] = ""
+                # LangChain/OpenAI SDK retries would be new native requests with
+                # new step numbers. Disable before any paid call in enforcement.
+                if budget.mode == "enforce":
+                    kwargs["max_retries"] = 0
+        model_id = kwargs.get("model") or kwargs.get("model_name") or kwargs.get("model_id")
+
         if provider == "openai":
             _check_pkg("langchain_openai")
             from langchain_openai import ChatOpenAI
+            from gpt_researcher.credentials import provider_key, reject_credential_kwargs, vault_mode
 
             # Support custom OpenAI-compatible APIs via OPENAI_BASE_URL
             if "openai_api_base" not in kwargs and os.environ.get("OPENAI_BASE_URL"):
                 kwargs["openai_api_base"] = os.environ["OPENAI_BASE_URL"]
 
+            if vault_mode():
+                # The managed key for this client only; LangChain must never read the env copy.
+                reject_credential_kwargs(kwargs)
+                kwargs["openai_api_key"] = provider_key("openai-chat", None)
             llm = ChatOpenAI(**kwargs)
         elif provider == "anthropic":
             _check_pkg("langchain_anthropic")
@@ -210,6 +285,21 @@ class GenericLLMProvider:
             _check_pkg("langchain_openai")
             from langchain_openai import ChatOpenAI
             from langchain_core.rate_limiters import InMemoryRateLimiter
+            from gpt_researcher.credentials import provider_key, reject_credential_kwargs
+
+            # Resolved for this client: a client built after a rotation gets the new key, while a stream
+            # already running keeps the client (and key) it started with.
+            reject_credential_kwargs(kwargs)
+            api_key = provider_key("openrouter-chat", lambda: os.environ["OPENROUTER_API_KEY"])
+
+            tracking = kwargs.pop("nevel_tracking", None)
+            extra_body = _build_openrouter_extra_body(tracking)
+            if extra_body:
+                kwargs["extra_body"] = _merge_extra_body(
+                    kwargs.pop("extra_body", None),
+                    extra_body,
+                )
+                kwargs.setdefault("stream_usage", True)
 
             rps = float(os.environ["OPENROUTER_LIMIT_RPS"]) if "OPENROUTER_LIMIT_RPS" in os.environ else 1.0
 
@@ -220,7 +310,7 @@ class GenericLLMProvider:
             )
 
             llm = ChatOpenAI(openai_api_base='https://openrouter.ai/api/v1',
-                     openai_api_key=os.environ["OPENROUTER_API_KEY"],
+                     openai_api_key=api_key,
                      rate_limiter=rate_limiter,
                      **kwargs
                 )
@@ -250,40 +340,66 @@ class GenericLLMProvider:
             raise ValueError(
                 f"Unsupported {provider}.\n\nSupported model providers are: {supported}"
             )
-        return cls(llm, chat_log, verbose=verbose)
+        return cls(llm, chat_log, verbose=verbose, model_id=model_id)
 
 
-    async def get_chat_response(self, messages, stream, websocket=None, **kwargs):
+    async def get_chat_response(self, messages, stream, websocket=None, cost_callback=None, **kwargs):
         if not stream:
             # Getting output from the model chain using ainvoke for asynchronous invoking
             output = await self.llm.ainvoke(messages, **kwargs)
+            usage_report = _extract_usage_report(output, self.model_id)
+            if usage_report and cost_callback:
+                cost_callback(usage_report)
 
             res = output.content
 
         else:
-            res = await self.stream_response(messages, websocket, **kwargs)
+            res = await self.stream_response(messages, websocket, cost_callback=cost_callback, **kwargs)
 
         if self.chat_logger:
             await self.chat_logger.log_request(messages, res)
 
         return res
 
-    async def stream_response(self, messages, websocket=None, **kwargs):
+    async def stream_response(self, messages, websocket=None, cost_callback=None, **kwargs):
         paragraph = ""
         response = ""
+        last_usage_report = None
 
-        # Streaming the response using the chain astream method from langchain
-        async for chunk in self.llm.astream(messages, **kwargs):
-            content = chunk.content
-            if content is not None:
-                response += content
-                paragraph += content
-                if "\n" in paragraph:
-                    await self._send_output(paragraph, websocket)
-                    paragraph = ""
+        # Usage chunks describe cumulative snapshots, not additive deltas. Keep
+        # the latest evidence and publish it once, including on cancellation or
+        # a downstream WebSocket/file failure after the provider charged us.
+        try:
+            # Close upstream promptly when the consumer disappears; don't leave
+            # a paid stream running until async-generator garbage collection.
+            async with aclosing(self.llm.astream(messages, **kwargs)) as stream:
+                async for chunk in stream:
+                    usage_report = _extract_usage_report(chunk, self.model_id)
+                    if usage_report:
+                        last_usage_report = usage_report
 
-        if paragraph:
-            await self._send_output(paragraph, websocket)
+                    content = chunk.content
+                    if content is not None:
+                        response += content
+                        paragraph += content
+                        if "\n" in paragraph:
+                            await self._send_output(paragraph, websocket)
+                            paragraph = ""
+
+            if paragraph:
+                await self._send_output(paragraph, websocket)
+        except BaseException:
+            if last_usage_report and cost_callback:
+                try:
+                    cost_callback(last_usage_report)
+                except Exception:
+                    # Preserve the original failure/cancellation. Never include
+                    # request payloads or provider credentials in this log.
+                    logging.getLogger(__name__).error("Research usage callback failed during stream cleanup")
+            raise
+        else:
+            if last_usage_report and cost_callback:
+                cost_callback(last_usage_report)
 
         return response
 

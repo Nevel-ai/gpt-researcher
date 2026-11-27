@@ -5,6 +5,7 @@ import os
 from .config import Config
 from .memory import Memory
 from .utils.enum import ReportSource, ReportType, Tone
+from .utils.usage import empty_research_usage, accumulate_research_usage
 from .llm_provider import GenericLLMProvider
 from .prompts import get_prompt_family
 from .vector_store import VectorStoreWrapper
@@ -140,14 +141,26 @@ class GPTResearcher:
         self.visited_urls = visited_urls or set()
         self.verbose = verbose
         self.context = context or []
-        self.headers = headers or {}
+        incoming_headers = headers or {}
+        self.nevel_tracking = incoming_headers.get("nevel_tracking")
+        self.headers = {
+            key: value
+            for key, value in incoming_headers.items()
+            if key not in {"nevel_tracking", "nevel_budget"}
+        }
+        self.llm_headers = dict(self.headers)
+        if self.nevel_tracking:
+            self.llm_headers["nevel_tracking"] = self.nevel_tracking
         self.research_costs = 0.0
+        self.research_usage = empty_research_usage()
         self.log_handler = log_handler
         self.prompt_family = get_prompt_family(prompt_family or self.cfg.prompt_family, self.cfg)
         
         # Process MCP configurations if provided
         self.mcp_configs = mcp_configs
         if mcp_configs:
+            from .utils.budget import require_budget_coverage
+            require_budget_coverage("external_mcp", "enabled", ())
             self._process_mcp_configs(mcp_configs)
         
         self.retrievers = get_retrievers(self.headers, self.cfg)
@@ -308,7 +321,7 @@ class GPTResearcher:
                 cfg=self.cfg,
                 parent_query=self.parent_query,
                 cost_callback=self.add_costs,
-                headers=self.headers,
+                headers=self.llm_headers,
                 prompt_family=self.prompt_family,
                 **self.kwargs,
                 # **filtered_kwargs
@@ -457,13 +470,24 @@ class GPTResearcher:
     def get_costs(self) -> float:
         return self.research_costs
 
+    def get_usage(self) -> dict:
+        return dict(self.research_usage)
+
     def set_verbose(self, verbose: bool):
         self.verbose = verbose
 
-    def add_costs(self, cost: float) -> None:
-        if not isinstance(cost, (float, int)):
-            raise ValueError("Cost must be an integer or float")
-        self.research_costs += cost
+    def add_costs(self, cost: float | dict) -> None:
+        self.research_usage = accumulate_research_usage(self.research_usage, cost)
+        self.research_costs = self.research_usage["cost"]
+        if isinstance(cost, dict):
+            if self.log_handler:
+                self._log_event("research", step="usage_update", details={
+                    "usage": cost,
+                    "total_usage": self.research_usage,
+                })
+
+            return
+
         if self.log_handler:
             self._log_event("research", step="cost_update", details={
                 "cost": cost,

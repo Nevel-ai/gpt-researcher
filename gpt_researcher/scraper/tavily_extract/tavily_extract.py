@@ -1,14 +1,20 @@
 from bs4 import BeautifulSoup
 import os
 from ..utils import get_relevant_images, extract_title
+from gpt_researcher.utils.budget import current_research_budget, ResearchBudgetError
+from gpt_researcher.credentials import CredentialUnavailableError, provider_key, vault_mode
 
 class TavilyExtract:
 
     def __init__(self, link, session=None):
         self.link = link
         self.session = session
-        from tavily import TavilyClient
-        self.tavily_client = TavilyClient(api_key=self.get_api_key())
+        # Vault mode resolves the key for every extraction instead of keeping one per scraper.
+        self.api_key = None if vault_mode() else self.get_api_key()
+        self.tavily_client = None
+        if current_research_budget.get() is None and not vault_mode():
+            from tavily import TavilyClient
+            self.tavily_client = TavilyClient(api_key=self.api_key)
 
     def get_api_key(self) -> str:
         """
@@ -36,7 +42,20 @@ class TavilyExtract:
         """
 
         try:
-            response = self.tavily_client.extract(urls=self.link)
+            api_key = provider_key("tavily-chat", lambda: self.api_key)
+            budget = current_research_budget.get()
+            if budget is not None:
+                native = budget.http_clients()["http_client"].post("https://api.tavily.com/extract", json={
+                    "urls": self.link, "extract_depth": "basic", "api_key": api_key,
+                }, timeout=100)
+                native.raise_for_status()
+                response = native.json()
+            else:
+                client = self.tavily_client
+                if client is None:
+                    from tavily import TavilyClient
+                    client = TavilyClient(api_key=api_key)
+                response = client.extract(urls=self.link)
             if response['failed_results']:
                 return "", [], ""
 
@@ -57,6 +76,8 @@ class TavilyExtract:
 
             return content, image_urls, title
 
+        except (ResearchBudgetError, CredentialUnavailableError):
+            raise
         except Exception as e:
             print("Error! : " + str(e))
             return "", [], ""

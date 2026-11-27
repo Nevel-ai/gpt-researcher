@@ -5,6 +5,10 @@ import os
 from typing import Literal, Sequence, Optional
 import requests
 import json
+from gpt_researcher.utils.budget import current_research_budget, ResearchBudgetError
+from gpt_researcher.credentials import (
+    CredentialPolicyError, CredentialUnavailableError, provider_key, reject_credential_headers, vault_mode,
+)
 
 
 class TavilySearch:
@@ -38,6 +42,10 @@ class TavilySearch:
         Returns:
 
         """
+        if vault_mode():
+            # The managed key is resolved for every request (_search); request headers never supply one.
+            reject_credential_headers(self.headers)
+            return None
         api_key = self.headers.get("tavily_api_key")
         if not api_key:
             try:
@@ -79,13 +87,17 @@ class TavilySearch:
             "include_domains": include_domains,
             "exclude_domains": exclude_domains,
             "include_images": include_images,
-            "api_key": self.api_key,
+            "api_key": provider_key("tavily-chat", lambda: self.api_key),
             "use_cache": use_cache,
         }
 
-        response = requests.post(
-            self.base_url, data=json.dumps(data), headers=self.headers, timeout=100
-        )
+        budget = current_research_budget.get()
+        if budget is not None:
+            response = budget.http_clients()["http_client"].post(self.base_url, json=data, headers=self.headers, timeout=100)
+        else:
+            response = requests.post(
+                self.base_url, data=json.dumps(data), headers=self.headers, timeout=100
+            )
 
         if response.status_code == 200:
             return response.json()
@@ -115,6 +127,8 @@ class TavilySearch:
             search_response = [
                 {"href": obj["url"], "body": obj["content"]} for obj in sources
             ]
+        except (ResearchBudgetError, CredentialUnavailableError, CredentialPolicyError):
+            raise
         except Exception as e:
             print(f"Error: {e}. Failed fetching sources. Resulting in empty response.")
             search_response = []
